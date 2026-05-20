@@ -6,6 +6,8 @@ By using the Arduino core and PlatformIO with pre-configured board setups, you c
 
 This isn't intended to be used in the same way as AP_Periph, which supports a bunch of Ardupilot sensors all at once and is adaptable without writing code. This is intended for writing a DroneCAN interface for any sensor or system, without having to deal with a large code base and lots of boilerplate.
 
+This repo is intended as a quick start project. Clone the project, build the default main.cpp and you're away!
+
 ## Features
 
 - Send DroneCAN messages ✅
@@ -43,7 +45,7 @@ framework = arduino
 
 PlatformIO fetches the platform on first build — no separate install step. To pick up new changes to the platform, force a refetch with `pio pkg uninstall --platform br-stm32 -g`.
 
-The DroneCAN library itself is pulled in the same way, pinned to a tag:
+The [libArduinoDroneCAN](https://github.com/BeyondRobotix/libArduinoDroneCAN) library itself is pulled in the same way, pinned to a tag:
 
 ```ini
 lib_deps = https://github.com/BeyondRobotix/libArduinoDroneCAN.git#v1.0.0

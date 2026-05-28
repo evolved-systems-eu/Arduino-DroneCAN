@@ -1,58 +1,47 @@
 #include <Arduino.h>
 #include <dronecan.h>
 
-// set up your parameters here with default values. NODEID should be kept
-std::vector<DroneCAN::parameter> custom_parameters = {
+std::vector<DroneCAN::parameter> params_port1 = {
     {"NODEID", DroneCAN::INT, 100, 1, 127},
     {"PARM_1", DroneCAN::REAL, 0.0f, 0.0f, 100.0f},
     {"PARM_2", DroneCAN::REAL, 0.0f, 0.0f, 100.0f},
 };
 
-DroneCAN dronecan;
+DroneCAN can1;
 
-uint32_t looptime = 0;
+uint32_t looptime1 = 0;
 
 void setup()
 {
-    // the following block of code should always run first. Adjust it at your own peril!
-    app_setup();
+    app_setup(); // This should always be at the start
     IWatchdog.begin(2000000);
     Serial.begin(115200);
-    Serial.println("Starting!");
-    dronecan.init(
-        custom_parameters,
-        "Beyond Robotix Node");
-    // end of important starting code
 
-    // an example of getting and setting parameters within the code
-    dronecan.setParameter("PARM_1", 50.0f); // set a parameter to 50.0
-    Serial.print("PARM_1 value: ");
-    Serial.println(dronecan.getParameter("PARM_1"));
+    can1.init(params_port1, "Beyond Robotix Node", DroneCAN::CanMode::Classic, DroneCAN::CanPort::PORT1);
+
+    Serial.print("Port1 NODEID: "); Serial.println(can1.getParameter("NODEID"));
 }
 
 void loop()
 {
     const uint32_t now = millis();
 
-    // send our battery message at 10Hz
-    // Don't use delay() since we need to call dronecan.cycle() as much as possible
-    if (now - looptime > 100)
+    // PORT1: broadcast BatteryInfo at 10 Hz
+    if (now - looptime1 > 100)
     {
-        looptime = millis();
+        looptime1 = now;
 
-        // collect MCU core temperature data
-        int32_t vref = __LL_ADC_CALC_VREFANALOG_VOLTAGE(analogRead(AVREF), LL_ADC_RESOLUTION_12B);
+        int32_t vref     = __LL_ADC_CALC_VREFANALOG_VOLTAGE(analogRead(AVREF), LL_ADC_RESOLUTION_12B);
         int32_t cpu_temp = __LL_ADC_CALC_TEMPERATURE(vref, analogRead(ATEMP), LL_ADC_RESOLUTION_12B);
 
-        // construct dronecan packet
         uavcan_equipment_power_BatteryInfo pkt{};
-        pkt.voltage = analogRead(PA1);
-        pkt.current = analogRead(PA0);
+        pkt.voltage     = analogRead(PA1);
+        pkt.current     = analogRead(PA0);
         pkt.temperature = cpu_temp;
 
-        sendUavcanMsg(dronecan.canard, pkt);
+        sendUavcanMsg(can1, pkt, CANARD_TRANSFER_PRIORITY_LOW);
     }
 
-    dronecan.cycle();
+    can1.cycle();
     IWatchdog.reload();
 }

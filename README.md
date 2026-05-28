@@ -15,8 +15,8 @@ This repo is intended as a quick start project. Clone the project, build the def
 - Standard DroneCAN under the hood (allocation, node info) ✅
 - DroneCAN Parameters ✅
 - Firmware update over CAN ✅
-- CANFD ❌ (coming soon)
-- Multiple CAN ports ❌
+- CANFD 🚦 (under construction)
+- Multiple CAN port instances ✅ (only on H7 nodes)
 
 ## Code Usage
 
@@ -48,7 +48,7 @@ PlatformIO fetches the platform on first build — no separate install step. To 
 The [libArduinoDroneCAN](https://github.com/BeyondRobotix/libArduinoDroneCAN) library itself is pulled in the same way, pinned to a tag:
 
 ```ini
-lib_deps = https://github.com/BeyondRobotix/libArduinoDroneCAN.git#v1.0.0
+lib_deps = https://github.com/BeyondRobotix/libArduinoDroneCAN.git#v1.1
 ```
 
 ## Currently Supported Hardware

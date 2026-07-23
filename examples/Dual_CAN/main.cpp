@@ -34,8 +34,10 @@ void setup()
     Serial.begin(115200);
     Serial.println("Starting dual-port!");
 
-    // Each instance gets its own canard context, memory pool, and flash page.
-    // storage_page defaults: PORT1 → last sector, PORT2 → second-to-last sector.
+    // Each instance gets its own canard context and memory pool. Parameter
+    // storage is shared: both instances log into the same pair of flash pages
+    // and are told apart by an instance tag in each record, so the second port
+    // costs no extra flash (which on H7 would be another 256 KB).
     can1.init(params_port1, "Beyond Robotix Node/Port1",
               DroneCAN::CanMode::FD, DroneCAN::CanPort::PORT1);
     can2.init(params_port2, "Beyond Robotix Node/Port2",

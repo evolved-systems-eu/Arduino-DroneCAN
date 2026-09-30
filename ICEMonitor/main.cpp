@@ -41,7 +41,7 @@
 // LB_EN / LB_DUTY / LB_FREQ are DroneCAN parameters, changeable live from GUI.
 // Remove this define (and the #ifdef sections below) before production use.
 // ---------------------------------------------------------------------------
-// #define LOOPBACK_TEST
+#define LOOPBACK_TEST
 #ifdef LOOPBACK_TEST
   #define LOOPBACK_PIN  PA1   // wire this to the injection input pin
 #endif
@@ -78,20 +78,20 @@ static uint32_t resolve_pin(int param_val)
 // Parameters
 // ---------------------------------------------------------------------------
 std::vector<DroneCAN::parameter> custom_parameters = {
-    {"NODEID",     DroneCAN::INT,  100,    0,          127       },
-    {"BAUD",       DroneCAN::INT,  1000,   500,        1000      }, // requires restart
+    {"NODEID",     DroneCAN::INT,  5,      0,          127       },
+    {"BAUD",       DroneCAN::INT,  500,    500,        1000      }, // requires restart
     {"INJ_PIN",    DroneCAN::INT,  8,      8,          101       }, // 8=PA8 9=PA9 10=PA10 100=PB0 101=PB1
-    {"BCAST_MS",   DroneCAN::INT,  100,    10,         5000      },
-    {"RPM_ALPHA",  DroneCAN::REAL, 1.0f,   0.01f,      1.0f      },
+    {"BCAST_MS",   DroneCAN::INT,  1000,   10,         5000      },
+    {"RPM_ALPHA",  DroneCAN::REAL, 0.2f,   0.01f,      1.0f      },
     {"RPM_A1",     DroneCAN::REAL, 1.0f,   -10000.0f,  10000.0f  },
     {"RPM_A0",     DroneCAN::REAL, 0.0f,   -100000.0f, 100000.0f },
-    {"DUTY_ALPHA", DroneCAN::REAL, 1.0f,   0.01f,      1.0f      },
+    {"DUTY_ALPHA", DroneCAN::REAL, 0.3f,   0.01f,      1.0f      },
     {"DUTY_A1",    DroneCAN::REAL, 1.0f,   -10000.0f,  10000.0f  },
     {"DUTY_A0",    DroneCAN::REAL, 0.0f,   -100000.0f, 100000.0f },
 #ifdef LOOPBACK_TEST
-    {"LB_EN",      DroneCAN::INT,  0,      0,          1         }, // 0=off 1=on
+    {"LB_EN",      DroneCAN::INT,  1,      0,          1         }, // 0=off 1=on
     {"LB_DUTY",    DroneCAN::INT,  50,     0,          100       }, // [%]
-    {"LB_FREQ",    DroneCAN::INT,  1000,   1,          20000     }, // [Hz]
+    {"LB_FREQ",    DroneCAN::INT,  60,     1,          20000     }, // [Hz]
 #endif
 };
 
@@ -200,8 +200,10 @@ void loop()
 
         // Stale check: no rising edge within 2000 ms → engine considered stopped
         // 2000 ms covers down to ~60 RPM (period between injections = 2 s)
+        // Require high_us > 0 so the EMA is never fed a partial first-cycle
+        // sample where period_us is set but high_us has not been updated yet.
         const bool running = (last_edge != 0) && ((now - last_edge) < 2000)
-                             && (period_us > 0);
+                             && (period_us > 0) && (high_us > 0);
 
         if (running) {
             // Raw measurements

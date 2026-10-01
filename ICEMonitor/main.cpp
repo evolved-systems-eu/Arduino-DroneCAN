@@ -173,11 +173,11 @@ void setup()
     attach_inj_pin(resolve_pin((int)dronecan.getParameter("INJ_PIN")));
 
 #ifdef LOOPBACK_TEST
-    analogWriteFrequency((int)dronecan.getParameter("LB_FREQ"));
-    analogWrite(LOOPBACK_PIN,
-                (int)dronecan.getParameter("LB_EN")
-                    ? (int)(dronecan.getParameter("LB_DUTY") * 255.0f / 100.0f)
-                    : 0);
+    if ((int)dronecan.getParameter("LB_EN")) {
+        analogWriteFrequency((int)dronecan.getParameter("LB_FREQ"));
+        analogWrite(LOOPBACK_PIN, (int)(dronecan.getParameter("LB_DUTY") * 255.0f / 100.0f));
+    }
+    // LB_EN=0: leave pin unconfigured (high-impedance INPUT)
 #endif
 }
 
@@ -264,11 +264,10 @@ void loop()
         }
 
 #ifdef LOOPBACK_TEST
-        const int lb_en = (int)dronecan.getParameter("LB_EN");
-        analogWriteFrequency((int)dronecan.getParameter("LB_FREQ"));
-        analogWrite(LOOPBACK_PIN,
-                    lb_en ? (int)(dronecan.getParameter("LB_DUTY") * 255.0f / 100.0f)
-                           : 0);
+        if ((int)dronecan.getParameter("LB_EN")) {
+            analogWriteFrequency((int)dronecan.getParameter("LB_FREQ"));
+            analogWrite(LOOPBACK_PIN, (int)(dronecan.getParameter("LB_DUTY") * 255.0f / 100.0f));
+        }
 #endif
     }
 

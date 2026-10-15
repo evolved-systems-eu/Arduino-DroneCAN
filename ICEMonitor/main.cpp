@@ -15,6 +15,15 @@
  *   filtered[n] = alpha × raw[n] + (1 − alpha) × filtered[n−1]
  *   output      = A1 × filtered + A0
  *
+ * Design assumption: reboot required for any configuration change
+ * ---------------------------------------------------------------
+ *   Any change to a signal source (THR_SRC, CLT_SRC), pin assignment
+ *   (FUELINJ_PIN, THR_PIN, CLT_PIN, TMP0_PIN, TMP1_PIN), or INA228 I2C
+ *   address (THR_I2C_ADDR, CLT_I2C_ADDR) takes effect only after a reboot.
+ *   All pin and source initialisation is performed once in setup().
+ *   The 1 Hz tick only refreshes scalar parameters (EMA alphas, scale/offset,
+ *   broadcast intervals) which are safe to update live.
+ *
  * Pin encoding (shared by all PIN parameters)
  * --------------------------------------------
  *   Negative value  → input disabled / not connected
@@ -24,10 +33,10 @@
  * ICE Status (uavcan.equipment.ice.reciprocating.Status)
  * -------------------------------------------------------
  *   Broadcast when at least one source is configured: FUELINJ_PIN ≥ 0,
- *   THR_PIN ≥ 0, CLT_SRC=2 with a valid I2C address, or CLT_SRC=1 with
- *   CLT_PIN ≥ 0. Because CLT_SRC defaults to 2 and CLT_I2C_ADDR defaults
- *   to 0x40, the message is broadcast by default even without FUELINJ_PIN
- *   or THR_PIN.
+ *   THR_SRC=2 with a valid I2C address, THR_SRC=1 with THR_PIN ≥ 0,
+ *   CLT_SRC=2 with a valid I2C address, or CLT_SRC=1 with CLT_PIN ≥ 0.
+ *   Because CLT_SRC defaults to 2 and CLT_I2C_ADDR defaults to 0x40,
+ *   the message is broadcast by default even without FUELINJ_PIN or THR.
  *
  *   NODEID     – DroneCAN node ID (default 5)
  *   BAUD       – CAN baudrate kbps: 500 or 1000 (default 500; stored in flash, effective after restart)
@@ -39,13 +48,15 @@
  *   DUTY_ALPHA – EMA alpha for duty cycle (default 0.3)
  *   DUTY_A1    – duty cycle linear scale  (default 1.0)
  *   DUTY_A0    – duty cycle linear offset (default 0.0)
- *   THR_PIN    – throttle analog input pin (default -1 = disabled)
+ *   THR_SRC    – throttle source: 0=disabled 1=ADC 2=I2C/INA228 (default 1; requires restart)
+ *   THR_I2C_ADDR – INA228 I2C address when THR_SRC=2 (default 0x40; requires restart)
+ *   THR_PIN    – ADC input pin when THR_SRC=1 (default -1 = disabled; requires restart)
  *   THR_ALPHA  – EMA alpha for throttle (default 1.0)
  *   THR_A1     – linear scale:  throttle_pct = A1×voltage + A0 (default 1.0)
  *   THR_A0     – linear offset (default 0.0)
  *   CLT_SRC    – coolant temp source: 0=disabled 1=ADC 2=I2C/INA228 (default 2; requires restart)
  *   CLT_I2C_ADDR – INA228 I2C address when CLT_SRC=2 (default 0x40; requires restart)
- *   CLT_PIN    – ADC input pin when CLT_SRC=1 (default -1 = disabled; live-updated)
+ *   CLT_PIN    – ADC input pin when CLT_SRC=1 (default -1 = disabled; requires restart)
  *   CLT_ALPHA  – EMA alpha for coolant temperature (default 1.0)
  *   CLT_A1     – linear scale:  coolant_temp = A1×voltage + A0 (default 1.0)
  *   CLT_A0     – linear offset (default 0.0)
@@ -164,13 +175,15 @@ std::vector<DroneCAN::parameter> custom_parameters = {
     {"DUTY_ALPHA", DroneCAN::REAL, 0.3f,   0.01f,      1.0f      },
     {"DUTY_A1",    DroneCAN::REAL, 1.0f,   -10000.0f,  10000.0f  },
     {"DUTY_A0",    DroneCAN::REAL, 0.0f,   -100000.0f, 100000.0f },
-    {"THR_PIN",    DroneCAN::INT,  -1,     -1,         101       }, // <0=disabled; ADC pin
+    {"THR_SRC",    DroneCAN::INT,  1,      0,          2         }, // 0=disabled 1=ADC 2=I2C/INA228; requires restart
+    {"THR_I2C_ADDR", DroneCAN::INT, 0x40, 0,          127       }, // INA228 I2C addr when THR_SRC=2; requires restart
+    {"THR_PIN",    DroneCAN::INT,  -1,     -1,         101       }, // ADC pin when THR_SRC=1; requires restart
     {"THR_ALPHA",  DroneCAN::REAL, 1.0f,   0.01f,      1.0f      },
     {"THR_A1",     DroneCAN::REAL, 1.0f,   -10000.0f,  10000.0f  },
     {"THR_A0",     DroneCAN::REAL, 0.0f,   -100000.0f, 100000.0f },
     {"CLT_SRC",    DroneCAN::INT,  2,      0,          2         }, // 0=disabled 1=ADC 2=I2C/INA228; requires restart
     {"CLT_I2C_ADDR", DroneCAN::INT, 0x40, 0,          127       }, // INA228 I2C addr when CLT_SRC=2; requires restart
-    {"CLT_PIN",    DroneCAN::INT,  -1,     -1,         101       }, // ADC pin when CLT_SRC=1; live-updated
+    {"CLT_PIN",    DroneCAN::INT,  -1,     -1,         101       }, // ADC pin when CLT_SRC=1; requires restart
     {"CLT_ALPHA",  DroneCAN::REAL, 1.0f,   0.01f,      1.0f      },
     {"CLT_A1",     DroneCAN::REAL, 1.0f,   -10000.0f,  10000.0f  },
     {"CLT_A0",     DroneCAN::REAL, 0.0f,   -100000.0f, 100000.0f },
@@ -283,6 +296,10 @@ static uint32_t thr_pin       = PA0;
 static float    thr_alpha     = 1.0f;
 static float    thr_a1        = 1.0f;
 static float    thr_a0        = 0.0f;
+static Adafruit_INA228 thr_meter;
+static bool            thr_ina228_ok = false;
+static int             thr_src       = 1;  // read once at startup; requires reboot to change
+static int             thr_i2c_addr  = 0x40;
 
 // Coolant temperature
 static int      clt_pin_param = -1;  // raw parameter value; <0 = disabled
@@ -322,7 +339,8 @@ static uint32_t loop_1hz   = 0;
 
 // ---------------------------------------------------------------------------
 // Resolve all pin parameters, check for conflicts, and apply.
-// Called from setup() and the 1 Hz refresh tick.
+// Called once from setup(); pin assignments are fixed for the lifetime of the
+// session (any change requires a reboot).
 // ---------------------------------------------------------------------------
 static void refresh_pin_params()
 {
@@ -342,6 +360,13 @@ static void refresh_pin_params()
             dronecan.setParameter(param_names[i], -1);
             param_vals[i] = -1;
         }
+    }
+
+    // THR_PIN (index 1) is only used when THR_SRC=1; mask it out otherwise to
+    // prevent spurious conflicts with CLT_PIN or TMP pins.
+    if (thr_src != 1) {
+        param_vals[1] = -1;
+        pins[1]       = PIN_NOT_FOUND;
     }
 
     // CLT_PIN (index 2) is only used when CLT_SRC=1; mask it out otherwise to
@@ -446,6 +471,18 @@ static void refresh_params()
     tmp1_bcast = (uint32_t)constrain((int)dronecan.getParameter("TMP1_BCAST"), 10, 5000);
 }
 
+// Attempt to (re-)initialise the THR INA228. Sets thr_ina228_ok.
+// Wire.begin() must already have been called.
+static void probe_thr_ina228()
+{
+    thr_ina228_ok = thr_meter.begin((uint8_t)thr_i2c_addr);
+    if (thr_ina228_ok) {
+        thr_meter.setAveragingCount(INA228_COUNT_16);
+        thr_meter.setVoltageConversionTime(INA228_TIME_1052_us);
+        thr_meter.setMode(INA228_MODE_CONT_BUS);
+    }
+}
+
 // Attempt to (re-)initialise the CLT INA228. Sets clt_ina228_ok.
 // Wire.begin() must already have been called.
 static void probe_clt_ina228()
@@ -467,10 +504,28 @@ void setup()
     dronecan.init(custom_parameters, "BR-ICEMonitor");
     refresh_params();
 
+    thr_src      = (int)dronecan.getParameter("THR_SRC");
+    thr_i2c_addr = (int)dronecan.getParameter("THR_I2C_ADDR");
     clt_src      = (int)dronecan.getParameter("CLT_SRC");
     clt_i2c_addr = (int)dronecan.getParameter("CLT_I2C_ADDR");
-    if (clt_src == 2 && clt_i2c_addr > 0) {
+    // Two INA228s on the same bus must have different addresses.
+    // If both are configured as I2C with the same address, disable both at runtime;
+    // the user must set different addresses (via THR_I2C_ADDR / CLT_I2C_ADDR) and restart.
+    if (thr_src == 2 && clt_src == 2 &&
+        thr_i2c_addr > 0 && clt_i2c_addr > 0 &&
+        thr_i2c_addr == clt_i2c_addr) {
+        dronecan.debug("THR/CLT INA228 addr conflict", 0);
+        thr_src = 0;
+        clt_src = 0;
+    }
+    if ((thr_src == 2 && thr_i2c_addr > 0) || (clt_src == 2 && clt_i2c_addr > 0))
         Wire.begin();
+    if (thr_src == 2 && thr_i2c_addr > 0) {
+        probe_thr_ina228();
+        if (!thr_ina228_ok)
+            dronecan.debug("THR INA228 not found", 0);
+    }
+    if (clt_src == 2 && clt_i2c_addr > 0) {
         probe_clt_ina228();
         if (!clt_ina228_ok)
             dronecan.debug("CLT INA228 not found", 0);
@@ -486,9 +541,11 @@ void loop()
     // -----------------------------------------------------------------------
     // ICE Status broadcast: at least one source must be configured
     // -----------------------------------------------------------------------
+    const bool thr_configured = (thr_src == 2 && thr_i2c_addr > 0) ||
+                                 (thr_src == 1 && thr_pin_param >= 0);
     const bool clt_configured = (clt_src == 2 && clt_i2c_addr > 0) ||
                                  (clt_src == 1 && clt_pin_param >= 0);
-    if ((fuelinj_pin_param >= 0 || thr_pin_param >= 0 || clt_configured) && (now - loop_bcast >= bcast_ms)) {
+    if ((fuelinj_pin_param >= 0 || thr_configured || clt_configured) && (now - loop_bcast >= bcast_ms)) {
         loop_bcast = now;
 
         uavcan_equipment_ice_reciprocating_Status pkt{};
@@ -545,18 +602,25 @@ void loop()
         }
 
         // --- Throttle position ---
-        if (thr_pin_param >= 0) {
-            const float voltage = analogRead(thr_pin) * (3.3f / 4095.0f);
-            if (!thr_seeded) { thr_filtered = voltage; thr_seeded = true; }
-            else thr_filtered = thr_alpha * voltage + (1.0f - thr_alpha) * thr_filtered;
-            const float thr_pct = thr_a1 * thr_filtered + thr_a0;
-            pkt.throttle_position_percent = (uint8_t)constrain(roundf(thr_pct), 0.0f, 100.0f);
-
-            //Serial.print("  Thr: "); Serial.print(thr_pct, 1); Serial.print(" %");
-        }
-        else
         {
-            pkt.throttle_position_percent = 0x7F;  // uint7 has no invalid sentinel; 127 is used to identify the invalid value.
+            bool  thr_valid   = false;
+            float thr_voltage = 0.0f;
+            if (thr_src == 2 && thr_ina228_ok) {
+                thr_voltage = thr_meter.getBusVoltage_V();
+                thr_valid   = true;
+            } else if (thr_src == 1 && thr_pin_param >= 0) {
+                thr_voltage = analogRead(thr_pin) * (3.3f / 4095.0f);
+                thr_valid   = true;
+            }
+            if (thr_valid) {
+                if (!thr_seeded) { thr_filtered = thr_voltage; thr_seeded = true; }
+                else thr_filtered = thr_alpha * thr_voltage + (1.0f - thr_alpha) * thr_filtered;
+                const float thr_pct = thr_a1 * thr_filtered + thr_a0;
+                pkt.throttle_position_percent = (uint8_t)constrain(roundf(thr_pct), 0.0f, 100.0f);
+                //Serial.print("  Thr: "); Serial.print(thr_pct, 1); Serial.print(" %");
+            } else {
+                pkt.throttle_position_percent = 0x7F;  // uint7 has no invalid sentinel; 127 is used to identify the invalid value.
+            }
         }
 
         // --- Coolant temperature ---
@@ -631,7 +695,8 @@ void loop()
     }
 
     // -----------------------------------------------------------------------
-    // 1 Hz: refresh cached parameters and handle FUELINJ_PIN / loopback changes
+    // 1 Hz: refresh scalar parameters (EMA alphas, scale/offset, intervals).
+    // Pin assignments and signal sources are fixed at boot; no pin refresh here.
     // -----------------------------------------------------------------------
     if (now - loop_1hz >= 1000) {
         loop_1hz = now;
@@ -639,6 +704,18 @@ void loop()
         refresh_params();
 
         // INA228 health-check and retry
+        if (thr_src == 2 && thr_i2c_addr > 0) {
+            if (!thr_ina228_ok) {
+                probe_thr_ina228();
+                if (thr_ina228_ok)
+                    dronecan.debug("THR INA228 found", 0);
+            } else if (!thr_meter.conversionReady()) {
+                // conversionReady() reads DIAG_ALRT/CNVR — see CLT block comment below.
+                thr_ina228_ok = false;
+                thr_seeded    = false;
+                dronecan.debug("THR INA228 lost", 0);
+            }
+        }
         if (clt_src == 2 && clt_i2c_addr > 0) {
             if (!clt_ina228_ok) {
                 // Sensor was missing at boot or lost: retry
@@ -661,7 +738,6 @@ void loop()
             }
         }
 
-        refresh_pin_params();
     }
 
     dronecan.cycle();

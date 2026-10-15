@@ -18,11 +18,13 @@
  * Design assumption: reboot required for any configuration change
  * ---------------------------------------------------------------
  *   Any change to a signal source (THR_SRC, CLT_SRC), pin assignment
- *   (FUELINJ_PIN, THR_PIN, CLT_PIN, TMP0_PIN, TMP1_PIN), or INA228 I2C
- *   address (THR_I2C_ADDR, CLT_I2C_ADDR) takes effect only after a reboot.
- *   All pin and source initialisation is performed once in setup().
+ *   (FUELINJ_PIN, THR_PIN, CLT_PIN, TMP0_PIN, TMP1_PIN), INA228 I2C address
+ *   (THR_I2C_ADDR, CLT_I2C_ADDR), RPM_MAX, or RPM_K_WIN takes effect only
+ *   after a reboot.  All pin, source, and bounds initialisation is performed
+ *   once in setup().
  *   The 1 Hz tick only refreshes scalar parameters (EMA alphas, scale/offset,
- *   broadcast intervals) which are safe to update live.
+ *   broadcast intervals, RPM_HOLD_MS, RPM_STOP_MS, RPM_ACCEL, RPM_K_ACC)
+ *   which are safe to update live.
  *
  * Pin encoding (shared by all PIN parameters)
  * --------------------------------------------
@@ -40,11 +42,17 @@
  *
  *   NODEID     – DroneCAN node ID (default 5)
  *   BAUD       – CAN baudrate kbps: 500 or 1000 (default 500; stored in flash, effective after restart)
- *   FUELINJ_PIN    – injection input pin (default 8 = A8); <0 = disabled
+ *   FUELINJ_PIN  – injection input pin (default 8 = A8); <0 = disabled
  *   BCAST_MS   – ICE Status broadcast interval ms (default 10)
+ *   RPM_MAX    – max measurable RPM; periods faster than this are rejected (default 8000; requires restart)
  *   RPM_ALPHA  – EMA alpha for RPM, 0.01–1.0 (default 0.2)
  *   RPM_A1     – RPM linear scale  (default 1.0)
  *   RPM_A0     – RPM linear offset (default 0.0)
+ *   RPM_HOLD_MS – ms no injection signal before holding last RPM + flagging CRANKSHAFT_SENSOR_ERROR (default 500)
+ *   RPM_STOP_MS – ms no injection signal before zeroing RPM and reporting STOPPED (default 3000); must be > RPM_HOLD_MS
+ *   RPM_ACCEL  – max plausible RPM/s change; samples exceeding this are rejected by the plausibility filter (default 5000)
+ *   RPM_K_WIN  – plausibility sliding window size (default 5; requires restart)
+ *   RPM_K_ACC  – passes required within the window to accept a sample into the EMA (default 3)
  *   DUTY_ALPHA – EMA alpha for duty cycle (default 0.3)
  *   DUTY_A1    – duty cycle linear scale  (default 1.0)
  *   DUTY_A0    – duty cycle linear offset (default 0.0)
@@ -102,8 +110,10 @@
 
 // Injection period bounds for a 4-stroke single-cylinder engine (1 injection per 2 rev):
 //   period_us = 120,000,000 / RPM
-#define MIN_PERIOD_US   12000u   //  10,000 RPM upper limit
+// min_period_us is computed from RPM_MAX at boot (requires restart to change).
+// RPM above RPM_MAX is reported as RPM_MAX (periods shorter than min_period_us are rejected).
 #define MAX_PERIOD_US  400000u   //     300 RPM lower limit
+static uint32_t min_period_us = 15000u; // 8,000 RPM default; set from RPM_MAX in setup()
 
 // ---------------------------------------------------------------------------
 // Pin map: parameter value → Arduino pin number
@@ -172,6 +182,12 @@ std::vector<DroneCAN::parameter> custom_parameters = {
     {"RPM_ALPHA",  DroneCAN::REAL, 0.2f,   0.01f,      1.0f      },
     {"RPM_A1",     DroneCAN::REAL, 1.0f,   -10000.0f,  10000.0f  },
     {"RPM_A0",     DroneCAN::REAL, 0.0f,   -100000.0f, 100000.0f },
+    {"RPM_MAX",    DroneCAN::INT,  8000,   100,        20000     }, // max measurable RPM; requires restart
+    {"RPM_HOLD_MS",DroneCAN::INT,  500,    100,        5000      }, // ms no signal -> hold RPM + error flag
+    {"RPM_STOP_MS",DroneCAN::INT,  3000,   500,        30000     }, // ms no signal -> zero RPM, STOPPED
+    {"RPM_ACCEL",  DroneCAN::REAL, 5000.0f, 100.0f,   100000.0f }, // max plausible RPM/s; plausibility filter
+    {"RPM_K_WIN",  DroneCAN::INT,  5,      2,          10        }, // sliding window size; requires restart
+    {"RPM_K_ACC",  DroneCAN::INT,  3,      1,          10        }, // passes in window required to update EMA
     {"DUTY_ALPHA", DroneCAN::REAL, 0.3f,   0.01f,      1.0f      },
     {"DUTY_A1",    DroneCAN::REAL, 1.0f,   -10000.0f,  10000.0f  },
     {"DUTY_A0",    DroneCAN::REAL, 0.0f,   -100000.0f, 100000.0f },
@@ -233,7 +249,7 @@ static void fuelinj_isr()
         // accumulators, but only if we have a valid pulse width for that cycle.
         if (fuelinj_rising_us != 0 && fuelinj_pending_high != 0) {
             const uint32_t period = now_us - fuelinj_rising_us;
-            if (period >= MIN_PERIOD_US && period <= MAX_PERIOD_US) {
+            if (period >= min_period_us && period <= MAX_PERIOD_US) {
                 fuelinj_period_sum   += period;
                 fuelinj_high_sum     += fuelinj_pending_high;
                 fuelinj_sample_count++;
@@ -270,6 +286,15 @@ static void attach_fuelinj_pin()
 static float rpm_filtered   = 0.0f;
 static float duty_filtered  = 0.0f;
 static bool  fuelinj_seeded = false; // true after first valid sample; reset on engine stop
+
+// Plausibility filter state (RPM only)
+#define RPM_K_WIN_MAX  10
+static bool     plaus_win[RPM_K_WIN_MAX]; // circular window: true = sample passed plausibility check
+static int      plaus_head   = 0;         // next write index
+static int      plaus_filled = 0;         // valid entries so far (0 .. rpm_k_win)
+static int      plaus_passes = 0;         // count of true entries in active window
+static float    plaus_ref_rpm = 0.0f;     // RPM of last individually-plausible sample
+static uint32_t plaus_ref_ms  = 0;        // millis() of last individually-plausible sample
 static float thr_filtered   = 0.0f;
 static bool  thr_seeded     = false; // reset when pin assignment changes
 static float clt_filtered   = 0.0f;
@@ -282,11 +307,16 @@ static bool  tmp1_seeded    = false; // reset when pin assignment changes
 // ---------------------------------------------------------------------------
 // Cached parameters – refreshed at 1 Hz from dronecan.getParameter()
 // ---------------------------------------------------------------------------
-static uint32_t bcast_ms   = 10;
-static float    rpm_alpha  = 1.0f;
-static float    rpm_a1     = 1.0f;
-static float    rpm_a0     = 0.0f;
-static float    duty_alpha = 1.0f;
+static uint32_t bcast_ms      = 10;
+static float    rpm_alpha     = 1.0f;
+static float    rpm_a1        = 1.0f;
+static float    rpm_a0        = 0.0f;
+static uint32_t rpm_hold_ms   = 500;
+static uint32_t rpm_stop_ms   = 3000;
+static float    rpm_max_accel = 5000.0f;
+static int      rpm_k_win     = 5;    // set from RPM_K_WIN at boot; requires restart
+static int      rpm_k_acc     = 3;
+static float    duty_alpha    = 1.0f;
 static float    duty_a1    = 1.0f;
 static float    duty_a0    = 0.0f;
 
@@ -447,10 +477,14 @@ static void refresh_pin_params()
 static void refresh_params()
 {
     bcast_ms   = (uint32_t)constrain((int)dronecan.getParameter("BCAST_MS"), 10, 5000);
-    rpm_alpha  = dronecan.getParameter("RPM_ALPHA");
-    rpm_a1     = dronecan.getParameter("RPM_A1");
-    rpm_a0     = dronecan.getParameter("RPM_A0");
-    duty_alpha = dronecan.getParameter("DUTY_ALPHA");
+    rpm_alpha     = dronecan.getParameter("RPM_ALPHA");
+    rpm_a1        = dronecan.getParameter("RPM_A1");
+    rpm_a0        = dronecan.getParameter("RPM_A0");
+    rpm_hold_ms   = (uint32_t)constrain((int)dronecan.getParameter("RPM_HOLD_MS"), 100, 5000);
+    rpm_stop_ms   = (uint32_t)constrain((int)dronecan.getParameter("RPM_STOP_MS"), 500, 30000);
+    rpm_max_accel = dronecan.getParameter("RPM_ACCEL");
+    rpm_k_acc     = (int)constrain((int)dronecan.getParameter("RPM_K_ACC"), 1, rpm_k_win);
+    duty_alpha    = dronecan.getParameter("DUTY_ALPHA");
     duty_a1    = dronecan.getParameter("DUTY_A1");
     duty_a0    = dronecan.getParameter("DUTY_A0");
     thr_alpha  = dronecan.getParameter("THR_ALPHA");
@@ -503,6 +537,12 @@ void setup()
     analogReadResolution(12); // 12-bit ADC: raw 0–4095 matches the 3.3/4095 conversion
     dronecan.init(custom_parameters, "BR-ICEMonitor");
     refresh_params();
+    {
+        const int rpm_max = (int)dronecan.getParameter("RPM_MAX");
+        min_period_us = (rpm_max > 0) ? (120000000u / (uint32_t)rpm_max) : 15000u;
+        rpm_k_win = (int)constrain((int)dronecan.getParameter("RPM_K_WIN"), 2, RPM_K_WIN_MAX);
+        rpm_k_acc = (int)constrain(rpm_k_acc, 1, rpm_k_win); // re-clamp after rpm_k_win is known
+    }
 
     thr_src      = (int)dronecan.getParameter("THR_SRC");
     thr_i2c_addr = (int)dronecan.getParameter("THR_I2C_ADDR");
@@ -554,47 +594,124 @@ void loop()
         if (fuelinj_pin_param >= 0) {
             // Snapshot and reset accumulators atomically
             noInterrupts();
-            const uint32_t period_sum   = fuelinj_period_sum;
-            const uint32_t high_sum     = fuelinj_high_sum;
-            const uint32_t count        = fuelinj_sample_count;
-            const uint32_t last_edge    = fuelinj_last_edge_ms;
+            const uint32_t period_sum = fuelinj_period_sum;
+            const uint32_t high_sum   = fuelinj_high_sum;
+            const uint32_t count      = fuelinj_sample_count;
+            const uint32_t last_edge  = fuelinj_last_edge_ms;
             fuelinj_period_sum   = 0;
             fuelinj_high_sum     = 0;
             fuelinj_sample_count = 0;
             interrupts();
 
-            // Stale: no edge seen for 2000 ms → engine stopped
-            const bool stale   = (last_edge == 0) || ((int32_t)(now - last_edge) >= 2000);
-            const bool running = !stale;
+            // Two-tier stale detection.
+            // The injection signal is absent during fuel cut-off even though the
+            // engine is still spinning.  Two timeouts let the consumer distinguish
+            // "engine running, data temporarily unavailable" from "engine stopped":
+            //   no_signal < RPM_HOLD_MS  : RUNNING  – fresh data, normal operation
+            //   no_signal < RPM_STOP_MS  : RUNNING  – hold last RPM; CRANKSHAFT_SENSOR_ERROR set
+            //   no_signal >= RPM_STOP_MS : STOPPED  – zero RPM; engine truly stopped
+            const int32_t  elapsed_i    = (last_edge == 0) ? INT32_MAX
+                                                            : (int32_t)(now - last_edge);
+            const uint32_t no_signal_ms = (elapsed_i < 0) ? 0u : (uint32_t)elapsed_i;
+            const bool stopped = (last_edge == 0) || (no_signal_ms >= rpm_stop_ms);
+            const bool held    = !stopped && (no_signal_ms >= rpm_hold_ms);
+            const bool running = !stopped;
 
-            if (stale) {
-                // No edge for 2000 ms: engine stopped, reset EMA
+            if (stopped) {
+                // Engine truly stopped: zero outputs and reset all filter state
                 rpm_filtered   = 0.0f;
                 duty_filtered  = 0.0f;
                 fuelinj_seeded = false;
-            } else if (count > 0) {
+                plaus_head     = 0;
+                plaus_filled   = 0;
+                plaus_passes   = 0;
+                plaus_ref_ms   = 0;
+                plaus_ref_rpm  = 0.0f;
+            } else if (!held && count > 0) {
+                // Fresh signal: apply plausibility filter before updating EMA.
+                //
+                // Each sample's implied RPM/s change is compared against RPM_ACCEL.
+                // This rejects: noise/bounce edges within the period bounds, skip-
+                // injection (every-other-cycle strategy implying an instant RPM/2
+                // change far above any physical limit), and anomalous post-cut-off
+                // first samples whose period spans the entire cut duration.
+                //
+                // A sliding window of RPM_K_WIN results is maintained.  The EMA is
+                // updated only when RPM_K_ACC of the last RPM_K_WIN samples pass,
+                // tolerating occasional single-sample rejections without stalling on
+                // genuine rapid RPM changes.  When fewer than RPM_K_ACC pass, the EMA
+                // is frozen at the last accepted value.
                 const float mean_period = (float)period_sum / (float)count;
                 const float mean_high   = (float)high_sum   / (float)count;
-                const float rpm_raw  = 120000000.0f / mean_period;
-                const float duty_raw = 100.0f * mean_high / mean_period;
-                if (!fuelinj_seeded) {
-                    // Seed with first sample to avoid ramping up from 0
-                    rpm_filtered   = rpm_raw;
-                    duty_filtered  = duty_raw;
-                    fuelinj_seeded = true;
+                const float rpm_raw     = 120000000.0f / mean_period;
+                const float duty_raw    = 100.0f * mean_high / mean_period;
+
+                bool plaus_pass;
+                if (plaus_ref_ms == 0) {
+                    // No reference yet (first sample after start/stop): accept unconditionally
+                    plaus_pass = true;
                 } else {
-                    rpm_filtered  = rpm_alpha  * rpm_raw  + (1.0f - rpm_alpha)  * rpm_filtered;
-                    duty_filtered = duty_alpha * duty_raw + (1.0f - duty_alpha) * duty_filtered;
+                    const float dt_s  = (float)(now - plaus_ref_ms) * 0.001f;
+                    const float accel = fabsf(rpm_raw - plaus_ref_rpm) / fmaxf(dt_s, 0.001f);
+                    plaus_pass = (accel <= rpm_max_accel);
                 }
+                if (plaus_pass) {
+                    plaus_ref_rpm = rpm_raw;
+                    plaus_ref_ms  = now;
+                }
+
+                // Update circular sliding window
+                if (plaus_filled < rpm_k_win) {
+                    // Window filling: append without overwriting
+                    plaus_win[plaus_head] = plaus_pass;
+                    if (plaus_pass) plaus_passes++;
+                    plaus_head = (plaus_head + 1) % rpm_k_win;
+                    plaus_filled++;
+                } else {
+                    // Window full: overwrite oldest entry
+                    if (plaus_win[plaus_head]) plaus_passes--;
+                    plaus_win[plaus_head] = plaus_pass;
+                    if (plaus_pass)         plaus_passes++;
+                    plaus_head = (plaus_head + 1) % rpm_k_win;
+                }
+
+                // Commit to EMA when the current sample individually passes AND
+                // the window confirms enough recent passes.  A rejected sample
+                // must never feed the EMA even if old True entries remain in
+                // the window (prevents skip-injection / spurious edges from
+                // contaminating the EMA while the window is still draining).
+                if (plaus_pass && plaus_passes >= rpm_k_acc) {
+                    if (!fuelinj_seeded) {
+                        // Seed with first accepted sample to avoid ramping up from 0
+                        rpm_filtered   = rpm_raw;
+                        duty_filtered  = duty_raw;
+                        fuelinj_seeded = true;
+                    } else {
+                        rpm_filtered  = rpm_alpha  * rpm_raw  + (1.0f - rpm_alpha)  * rpm_filtered;
+                        duty_filtered = duty_alpha * duty_raw + (1.0f - duty_alpha) * duty_filtered;
+                    }
+                }
+                // else: plausibility window not passing threshold — freeze EMA
             }
-            // count==0 and not stale: signal active but no complete cycle in this
-            // window (broadcast interval shorter than signal period) — keep previous EMA
+            // held || count==0: EMA frozen, last value held
 
             pkt.state = running
                 ? UAVCAN_EQUIPMENT_ICE_RECIPROCATING_STATUS_STATE_RUNNING
                 : UAVCAN_EQUIPMENT_ICE_RECIPROCATING_STATUS_STATE_STOPPED;
             pkt.engine_speed_rpm            = (uint32_t)constrain(rpm_a1 * rpm_filtered + rpm_a0, 0.0f, 131071.0f);
             pkt.fuel_consumption_rate_cm3pm = duty_a1 * duty_filtered + duty_a0;
+
+            // FLAG_CRANKSHAFT_SENSOR_ERROR: set when RPM data is held (no fresh signal)
+            // or when the plausibility filter is actively rejecting samples.
+            const bool plaus_rejecting = !held
+                                      && (plaus_filled >= rpm_k_win)
+                                      && (plaus_passes  < rpm_k_acc);
+            const bool crank_error = running && (held || plaus_rejecting);
+            pkt.flags =
+                UAVCAN_EQUIPMENT_ICE_RECIPROCATING_STATUS_FLAG_CRANKSHAFT_SENSOR_ERROR_SUPPORTED
+                | (crank_error
+                    ? UAVCAN_EQUIPMENT_ICE_RECIPROCATING_STATUS_FLAG_CRANKSHAFT_SENSOR_ERROR
+                    : 0u);
 
             //Serial.print(running ? "RUNNING" : "STOPPED");
             //Serial.print("  RPM: "); Serial.print(pkt.engine_speed_rpm);

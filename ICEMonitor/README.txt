@@ -16,12 +16,14 @@ CONFIGURATION REQUIRES REBOOT
 ------------------------------
 
 Any change to a signal source (THR_SRC, CLT_SRC), pin assignment
-(FUELINJ_PIN, THR_PIN, CLT_PIN, TMP0_PIN, TMP1_PIN), or INA228 I2C address
-(THR_I2C_ADDR, CLT_I2C_ADDR) takes effect only after a reboot. All pin and
-source initialisation is performed once at startup.
+(FUELINJ_PIN, THR_PIN, CLT_PIN, TMP0_PIN, TMP1_PIN), INA228 I2C address
+(THR_I2C_ADDR, CLT_I2C_ADDR), RPM_MAX, or RPM_K_WIN takes effect only after
+a reboot. All pin, source, and bounds initialisation is performed once at
+startup.
 
 The following parameters are updated live at 1 Hz without reboot:
-  BCAST_MS, RPM_ALPHA, RPM_A1, RPM_A0, DUTY_ALPHA, DUTY_A1, DUTY_A0,
+  BCAST_MS, RPM_ALPHA, RPM_A1, RPM_A0, RPM_HOLD_MS, RPM_STOP_MS,
+  RPM_ACCEL, RPM_K_ACC, DUTY_ALPHA, DUTY_A1, DUTY_A0,
   THR_ALPHA, THR_A1, THR_A0, CLT_ALPHA, CLT_A1, CLT_A0,
   TMP0_ALPHA, TMP0_A1, TMP0_A0, TMP0_BCAST,
   TMP1_ALPHA, TMP1_A1, TMP1_A0, TMP1_BCAST.
@@ -57,7 +59,7 @@ Engine : Single cylinder, 4-stroke
 
 Signal characteristics:
   - Idle RPM range  : ~1000-3000 RPM -> period 40-120 ms
-  - Max RPM range   : up to ~10000 RPM -> period ~12 ms
+  - Max RPM range   : up to RPM_MAX (default 8000 RPM -> period 15 ms; capped)
   - Pulse width     : typically 2-20 ms depending on load
   - Logic level     : 3.3 V max (see PIN TABLE)
 
@@ -76,11 +78,14 @@ rising edges equals one full injection cycle = 2 crankshaft revolutions.
 
 Example: period_us = 20,000 us -> RPM = 120,000,000 / 20,000 = 6000 RPM
 
-Only periods within [12,000 us, 400,000 us] (300-10,000 RPM) are accepted.
+Only periods within [120,000,000/RPM_MAX us, 400,000 us] are accepted.
+With the default RPM_MAX = 8000: [15,000 us, 400,000 us] = 300-8,000 RPM.
 Periods outside this range are silently discarded to reject noise glitches.
+Signals faster than RPM_MAX are rejected; the EMA holds its last value and
+the output is capped at RPM_MAX. RPM_MAX requires reboot to change.
 
 All complete injection cycles committed during the broadcast window are
-averaged before being fed into the EMA filter:
+averaged before being fed into the plausibility filter and EMA:
 
     mean_period = sum(period_us) / count
     mean_high   = sum(high_us)   / count
@@ -91,14 +96,52 @@ broadcast. The ISR staging variables (last rising edge timestamp, pending pulse
 width) are NOT reset, so a cycle that spans two broadcast windows is still
 committed correctly at the next rising edge.
 
-When no new complete cycle falls within a broadcast window but the signal is
-still active (an edge was seen within the last 2000 ms), the previous EMA
-values are preserved and STATE_RUNNING is reported. RPM and duty cycle are
-only zeroed when the signal goes truly stale (no edge for 2000 ms), at which
-point STATE_STOPPED is reported.
 
-Signal stale timeout: 2000 ms (covers down to ~60 RPM engine speed, at which
-point period = 2,000,000 us = 2 s).
+FUEL CUT-OFF AND SIGNAL RELIABILITY
+-------------------------------------
+
+The injection signal is absent during fuel cut-off (overspeed protection,
+deceleration fuel cut) even though the engine is still spinning. A single
+stale timeout would incorrectly report STATE_STOPPED in this situation.
+
+Two-tier stale detection (RPM_HOLD_MS / RPM_STOP_MS):
+
+  No signal for < RPM_HOLD_MS   : STATE_RUNNING, EMA updated normally.
+  No signal for < RPM_STOP_MS   : STATE_RUNNING, last RPM held, EMA frozen,
+                                   FLAG_CRANKSHAFT_SENSOR_ERROR set in flags.
+  No signal for >= RPM_STOP_MS  : STATE_STOPPED, RPM zeroed, filter reset.
+
+RPM_HOLD_MS must be less than RPM_STOP_MS for the hold tier to be active.
+
+Plausibility filter (RPM_ACCEL / RPM_K_WIN / RPM_K_ACC):
+
+Some ECUs implement overspeed protection by firing the injector on every other
+cycle (injection skipping). This makes the measured period appear doubled and
+RPM appear halved, with no way to detect it from the period alone. The
+plausibility filter addresses this:
+
+  Each sample's implied rate of RPM change [RPM/s] is computed against the
+  last accepted sample:
+
+      accel = |rpm_new - rpm_last_accepted| / dt_seconds
+
+  If accel > RPM_ACCEL the sample is individually rejected. Results are kept
+  in a sliding window of RPM_K_WIN entries. The EMA is updated only when at
+  least RPM_K_ACC of the last RPM_K_WIN samples pass. When fewer pass, the
+  EMA is frozen and FLAG_CRANKSHAFT_SENSOR_ERROR is set.
+
+  Why this works for injection skipping: at 8000 RPM, a sudden halving to
+  4000 RPM implies ~133,000 RPM/s -- 26x above the default RPM_ACCEL of
+  5000 RPM/s -- so every skip-injection sample is rejected. Normal injection
+  resuming after the cut passes the check (the elapsed time since the last
+  accepted sample is large, making any plausible deceleration acceptable).
+
+  The sliding window (rather than requiring all-consecutive passes) tolerates
+  a single spurious rejection without stalling the filter.
+
+FLAG_CRANKSHAFT_SENSOR_ERROR is also set during the hold tier (RPM_HOLD_MS to
+RPM_STOP_MS), so consumers always have an unambiguous signal when the RPM
+value may be stale.
 
 Note on BCAST_MS vs signal period: the broadcast interval does not need to
 exceed the signal period. Cycles committed in a previous window carry over
@@ -295,9 +338,15 @@ ICE Status (uavcan.equipment.ice.reciprocating.Status)
   BAUD          | INT  | 500     | 500       | 1000     | CAN baudrate in kbps (*)
   FUELINJ_PIN   | INT  | 8       | -1        | 101      | Injection input pin; <0=disabled (*)
   BCAST_MS      | INT  | 10      | 10        | 5000     | ICE Status broadcast interval [ms]
+  RPM_MAX       | INT  | 8000    | 100       | 20000    | Max measurable RPM; faster periods rejected (*)
   RPM_ALPHA     | REAL | 0.2     | 0.01      | 1.0      | EMA alpha for RPM
   RPM_A1        | REAL | 1.0     | -10000.0  | 10000.0  | RPM linear scale
   RPM_A0        | REAL | 0.0     | -100000.0 | 100000.0 | RPM linear offset
+  RPM_HOLD_MS   | INT  | 500     | 100       | 5000     | ms no signal -> hold RPM + CRANKSHAFT_SENSOR_ERROR
+  RPM_STOP_MS   | INT  | 3000    | 500       | 30000    | ms no signal -> zero RPM, STATE_STOPPED
+  RPM_ACCEL     | REAL | 5000.0  | 100.0     | 100000.0 | Max plausible RPM/s; plausibility filter threshold
+  RPM_K_WIN     | INT  | 5       | 2         | 10       | Plausibility sliding window size (*)
+  RPM_K_ACC     | INT  | 3       | 1         | 10       | Passes required in window to update EMA
   DUTY_ALPHA    | REAL | 0.3     | 0.01      | 1.0      | EMA alpha for duty cycle
   DUTY_A1       | REAL | 1.0     | -10000.0  | 10000.0  | Duty cycle linear scale
   DUTY_A0       | REAL | 0.0     | -100000.0 | 100000.0 | Duty cycle linear offset
@@ -343,13 +392,19 @@ Broadcast at BCAST_MS interval when at least one source is configured
 
   Field                       | Source
   ----------------------------|----------------------------------------------
-  state                       | STATE_RUNNING when FUELINJ_PIN active and
-                              |   signal not stale (edge within last 2000 ms)
-                              | STATE_STOPPED otherwise
-  flags                       | 0
+  state                       | STATE_RUNNING when no_signal < RPM_STOP_MS
+                              |   (includes the hold tier; engine still spinning)
+                              | STATE_STOPPED when no_signal >= RPM_STOP_MS
+                              |   or FUELINJ_PIN disabled
+  flags                       | FLAG_CRANKSHAFT_SENSOR_ERROR_SUPPORTED always set
+                              |   when FUELINJ_PIN is enabled.
+                              | FLAG_CRANKSHAFT_SENSOR_ERROR additionally set when:
+                              |   - hold tier active (RPM_HOLD_MS..RPM_STOP_MS), or
+                              |   - plausibility filter is rejecting samples
+                              |   (RPM value is frozen at last accepted reading)
   engine_load_percent         | 0
   engine_speed_rpm            | RPM after EMA + linear transform; 0 if
-                              |   FUELINJ_PIN disabled or signal stale
+                              |   FUELINJ_PIN disabled or truly stopped
   fuel_consumption_rate_cm3pm | Injection duty cycle [%] after EMA + transform
                               |   (repurposed field -- see note below)
   coolant_temperature         | CLT: A1 x V + A0 after EMA when valid;

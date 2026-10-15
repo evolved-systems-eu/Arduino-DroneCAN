@@ -1,0 +1,168 @@
+ICEMonitor – TODO / Design Notes
+=================================
+
+
+RPM RELIABILITY DURING FUEL CUT-OFF AND INJECTION SKIPPING
+------------------------------------------------------------
+
+Status: design under consideration, not yet implemented.
+
+
+BACKGROUND
+----------
+
+RPM is derived entirely from the fuel injection signal. Any condition in which
+the ECU stops or reduces injection while the engine is still spinning causes
+the firmware to report incorrect RPM data. Two concrete scenarios:
+
+  Scenario A – Full fuel cut-off
+    The ECU stops injecting completely (decel fuel cut, overspeed protection).
+    The engine continues to spin under momentum or compression braking.
+    No rising edges arrive; the existing stale detection eventually fires
+    (currently 2000 ms) and reports STATE_STOPPED + RPM=0, which is wrong.
+    The engine is running; it is simply not injecting.
+
+  Scenario B – Injection skipping (every-other-cycle strategy)
+    Some ECUs implement overspeed protection by firing the injector on every
+    other cycle instead of cutting completely. The measured period between
+    consecutive rising edges is ~2x the actual crankshaft period, so the
+    computed RPM is ~50% of the true engine speed. All samples pass the period
+    bounds check [MIN_PERIOD_US, MAX_PERIOD_US] because the doubled period is
+    still a plausible engine speed; the anomaly is invisible to simple bounds
+    filtering.
+
+
+CURRENT BEHAVIOUR PROBLEMS
+---------------------------
+
+  1. Scenario A: engine is still running but STATE_STOPPED + RPM=0 is reported
+     as soon as the stale timeout expires. Reconnects abruptly when injection
+     resumes; first post-cut sample may have a very long period (spanning the
+     cut) which could give a spurious low RPM reading before converging.
+
+  2. Scenario B: RPM reads ~50% of actual with no indication that the value
+     is unreliable. FLAG_CRANKSHAFT_SENSOR_ERROR would NOT be set because
+     valid-looking samples continue to arrive.
+
+  3. General: a single anomalous period (from noise, bounce, or the first
+     post-cut injection) enters the EMA filter at weight alpha and shifts the
+     output. With RPM_ALPHA=0.2 and BCAST_MS=10 ms this is small but visible.
+
+
+OPTIONS CONSIDERED
+------------------
+
+Option 1 – Two-tier stale timeout (partially addresses Scenario A only)
+  Introduce two configurable thresholds:
+    RPM_HOLD_MS  (e.g. 500 ms)  : no new cycle -> hold last RPM, STATE_RUNNING,
+                                   set FLAG_CRANKSHAFT_SENSOR_ERROR_SUPPORTED |
+                                   FLAG_CRANKSHAFT_SENSOR_ERROR in flags field.
+    RPM_STOP_MS  (e.g. 3000 ms) : still no cycle -> zero RPM, STATE_STOPPED,
+                                   clear error flag.
+  Advantage: consumers can distinguish "engine running, RPM data stale" from
+  "engine stopped". Simple to implement.
+  Limitation: does not address Scenario B at all (skip injection still reads
+  50% RPM with no flag set).
+
+Option 2 – Consecutive-sample plausibility filter (addresses both scenarios)
+  Idea: before accepting a new period into the EMA, validate it against recent
+  history. Require K consecutive consistent samples before committing a change.
+  Use both acceleration/deceleration limits and last reported RPM as reference.
+
+  Plausibility check per sample:
+    a. Compute implied RPM from new period.
+    b. Compute RPM delta vs. last accepted RPM:
+         delta_rpm = |new_rpm - last_accepted_rpm|
+    c. Compute time elapsed since last accepted sample:
+         dt_ms = time since last committed cycle
+    d. Compute implied acceleration (RPM/s):
+         accel = delta_rpm / (dt_ms / 1000.0)
+    e. Accept the sample only if accel <= MAX_RPM_ACCEL (configurable,
+       e.g. 5000 RPM/s covers aggressive but physically plausible changes).
+       Reject if the implied change is too fast to be real deceleration or
+       acceleration.
+
+  Consecutive-sample requirement:
+    Maintain a counter of how many consecutive samples have passed the
+    plausibility check. Only update the EMA after K_ACCEPT (e.g. 3) consecutive
+    passing samples. On the first rejection, reset the counter (but do not
+    necessarily zero RPM).
+
+  Handling Scenario B (skip injection at 8000 RPM):
+    If last accepted RPM = 8000 and a new sample implies 4000 RPM:
+      delta = 4000, dt ~ 30 ms (two injection periods at 8000 RPM)
+      accel = 4000 / 0.030 = 133,000 RPM/s -> FAR above MAX_RPM_ACCEL
+      -> sample rejected, counter reset, CRANKSHAFT_SENSOR_ERROR flagged.
+    The engine maintains the held 8000 RPM until either:
+      - K_ACCEPT consecutive plausible samples arrive (normal injection
+        resumes), OR
+      - RPM_HOLD_MS elapses with no accepted sample (enter hold state).
+
+  Handling Scenario A (full cut, post-cut first sample):
+    First post-cut period spans the cut duration -> very long -> either
+    rejected by MAX_PERIOD_US, or accepted but implies near-zero RPM:
+      delta ~= last_rpm, dt = cut_duration
+      accel = last_rpm / cut_duration_s  -- at 8000 RPM after 1 s cut:
+              8000 / 1.0 = 8000 RPM/s -> above typical MAX_RPM_ACCEL -> rejected.
+    Subsequent normal samples converge in K_ACCEPT cycles.
+
+  Advantage: handles both scenarios; self-correcting; error flag is meaningful.
+  Additional benefit: also rejects spurious edges (noise, EMI, signal bounce)
+  that happen to fall within the [MIN_PERIOD_US, MAX_PERIOD_US] bounds and
+  would otherwise slip through into the EMA. A false edge triggered by noise
+  at 2000 RPM that implies a jump to 5000 RPM occurs in one period (~60 ms),
+  giving ~50,000 RPM/s — well above MAX_RPM_ACCEL. The period bounds check
+  and the plausibility filter together form two independent rejection layers.
+  Limitation: introduces a latency of K_ACCEPT injection cycles before RPM
+  tracks a genuine rapid change (e.g. quick throttle blip). At idle (1000 RPM,
+  period 120 ms), K=3 -> ~360 ms delay. At 8000 RPM, K=3 -> ~45 ms. This
+  delay was accepted as a design trade-off.
+
+Option 2 parameters (proposed, to be tuned):
+  RPM_HOLD_MS   – ms with no accepted sample before holding RPM   (e.g. 500)
+  RPM_STOP_MS   – ms with no accepted sample before zeroing RPM   (e.g. 3000)
+  MAX_RPM_ACCEL – maximum plausible RPM/s change per sample       (e.g. 5000)
+  K_ACCEPT      – consecutive passing samples required to commit  (e.g. 3)
+
+All four could be DroneCAN parameters (live-updatable, no reboot needed).
+
+
+OPEN QUESTIONS
+--------------
+
+  Q1. RESOLVED. Maximum operating RPM is 8000. RPM above 8000 is reported as
+      8000 (MIN_PERIOD_US = 15000 µs). Any sample implying RPM > 8000 is
+      rejected by the period bounds check.
+      Observed maximum acceleration: 1300 -> 6500 RPM in 1.8 s = ~2900 RPM/s.
+      MAX_RPM_ACCEL = 5000 RPM/s (adds ~70% headroom over observed maximum).
+      Skip injection at 8000 RPM implies 4000 RPM drop in ~30 ms = 133,000
+      RPM/s — 26x above the threshold, giving very comfortable rejection margin.
+
+  Q2. RESOLVED. Skip injection causes an immediate discrete jump from period T
+      to 2T with no intermediate values. With the plausibility filter, the
+      first skip-injection sample is rejected (133,000 RPM/s implied change).
+      Every subsequent skip-injection sample is also rejected because all imply
+      RPM/2 relative to the last accepted RPM, which remains the pre-skip value.
+      The engine stays in hold/error state for the entire skip-injection event.
+      When normal injection resumes, the period returns to T and is accepted
+      after K_ACCEPT consecutive passing samples. No intermediate spurious RPM
+      values are ever committed to the EMA.
+
+  Q3. RESOLVED. Use a sliding window: accept if K_ACCEPT of the last K_WINDOW
+      samples pass the plausibility check. More tolerant of a single spurious
+      rejection in an otherwise clean signal without resetting the whole counter.
+      Proposed defaults: K_WINDOW = 5, K_ACCEPT = 3.
+
+  Q4. RESOLVED. Freeze the EMA when samples are being rejected. The primary
+      scenario is overspeed protection: RPM will return to normal after a short
+      event. If it does not (genuine engine stop), the hold/stop timeout will
+      eventually zero RPM and report STATE_STOPPED via the two-tier stale
+      mechanism. A frozen-then-zeroed reading causes no harm in that case.
+
+
+IMPLEMENTED
+-----------
+
+Option 2 (plausibility filter) implemented, which subsumes Option 1
+(the two-tier stale naturally produces hold/stop as a side effect of the
+no-accepted-sample timeout).  See main.cpp broadcast loop RPM block.

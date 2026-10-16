@@ -407,6 +407,15 @@ def scenario_5() -> List[dict]:
         RPM output stays at 8000 throughout the skip event.
         CRANK_ERR fires after K_WIN-K_ACC+1=3 consecutive rejections drop
         passes below K_ACC.
+
+    BCAST_MS dependency:
+        The plausibility check uses the mean period of all cycles committed
+        within one broadcast window.  If BCAST_MS is large enough that a
+        normal and a skip cycle both land in the same window, their periods
+        are averaged and the implied RPM change appears smaller, potentially
+        passing the filter.  At the default BCAST_MS=10 ms and 8000 RPM
+        (period=15 ms) at most one cycle lands per window, so this is not
+        a concern in practice.
     """
     # Skip duration kept to 700 ms so that the implied accel (4000 RPM over
     # elapsed dt since last accepted) stays above RPM_ACCEL throughout:

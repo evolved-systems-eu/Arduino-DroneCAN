@@ -227,85 +227,80 @@ std::vector<DroneCAN::parameter> custom_parameters = {
 DroneCAN dronecan;
 
 // ---------------------------------------------------------------------------
-// ISR state – written only from the ISR, read with interrupts disabled
+// FuelInjState – ISR accumulators (volatile) + pin assignment
+// Written from fuelinj_isr(); read with interrupts disabled in the broadcast loop.
 // ---------------------------------------------------------------------------
-static volatile uint32_t fuelinj_rising_us    = 0; // micros() at the last rising edge
-static volatile uint32_t fuelinj_pending_high = 0; // pulse width of the cycle in progress (not yet committed)
-static volatile uint32_t fuelinj_period_sum   = 0; // accumulator: sum of committed period_us values
-static volatile uint32_t fuelinj_high_sum     = 0; // accumulator: sum of committed high_us values
-static volatile uint32_t fuelinj_sample_count = 0; // number of complete cycles committed since last broadcast
-static volatile uint32_t fuelinj_last_edge_ms = 0; // millis() at the last edge
-
-static int      fuelinj_pin_param = INT32_MIN; // sentinel: not yet initialised; triggers attach on first refresh_pin_params()
-static uint32_t active_pin    = PA8;
-
-static void fuelinj_isr()
-{
-    const uint32_t now_us = micros();
-    fuelinj_last_edge_ms = millis();
-
-    if (digitalRead(active_pin) == HIGH) {
-        // Rising edge: commit the just-completed cycle as a matched pair into the
-        // accumulators, but only if we have a valid pulse width for that cycle.
-        if (fuelinj_rising_us != 0 && fuelinj_pending_high != 0) {
-            const uint32_t period = now_us - fuelinj_rising_us;
-            if (period >= min_period_us && period <= MAX_PERIOD_US) {
-                fuelinj_period_sum   += period;
-                fuelinj_high_sum     += fuelinj_pending_high;
-                fuelinj_sample_count++;
-            }
-            fuelinj_pending_high = 0;
-        }
-        fuelinj_rising_us = now_us;
-    } else {
-        // Falling edge: record pulse width of the cycle in progress
-        if (fuelinj_rising_us != 0) {
-            fuelinj_pending_high = now_us - fuelinj_rising_us;
-        }
-    }
-}
-
-// Reset ISR state and attach interrupt to active_pin (caller must set active_pin first).
-static void attach_fuelinj_pin()
-{
-    noInterrupts();
-    fuelinj_rising_us    = 0;
-    fuelinj_pending_high = 0;
-    fuelinj_period_sum   = 0;
-    fuelinj_high_sum     = 0;
-    fuelinj_sample_count = 0;
-    fuelinj_last_edge_ms = 0;
-    interrupts();
-    pinMode(active_pin, INPUT);
-    attachInterrupt(digitalPinToInterrupt(active_pin), fuelinj_isr, CHANGE);
-}
-
-// ---------------------------------------------------------------------------
-// EMA filter state – persists between broadcast cycles
-// ---------------------------------------------------------------------------
-static float rpm_filtered   = 0.0f;
-static float duty_filtered  = 0.0f;
-static bool  fuelinj_seeded = false; // true after first valid sample; reset on engine stop
-
-// Plausibility filter state (RPM only)
 #define RPM_K_WIN_MAX  10
-static bool     plaus_win[RPM_K_WIN_MAX]; // circular window: true = sample passed plausibility check
-static int      plaus_head   = 0;         // next write index
-static int      plaus_filled = 0;         // valid entries so far (0 .. rpm_k_win)
-static int      plaus_passes = 0;         // count of true entries in active window
-static float    plaus_ref_rpm = 0.0f;     // RPM of last individually-plausible sample
-static uint32_t plaus_ref_ms  = 0;        // millis() of last individually-plausible sample
-static float thr_filtered   = 0.0f;
-static bool  thr_seeded     = false; // reset when pin assignment changes
-static float clt_filtered   = 0.0f;
-static bool  clt_seeded     = false; // reset on sensor loss or pin change
-static float tmp0_filtered  = 0.0f;
-static bool  tmp0_seeded    = false; // reset when pin assignment changes
-static float tmp1_filtered  = 0.0f;
-static bool  tmp1_seeded    = false; // reset when pin assignment changes
+
+struct FuelInjState {
+    volatile uint32_t rising_us    = 0; // micros() at the last rising edge
+    volatile uint32_t pending_high = 0; // pulse width of the cycle in progress (not yet committed)
+    volatile uint32_t period_sum   = 0; // accumulator: sum of committed period_us values
+    volatile uint32_t high_sum     = 0; // accumulator: sum of committed high_us values
+    volatile uint32_t sample_count = 0; // number of complete cycles committed since last broadcast
+    volatile uint32_t last_edge_ms = 0; // millis() at the last edge
+    int      pin_param = INT32_MIN;     // sentinel: not yet initialised; triggers attach on first refresh_pin_params()
+    uint32_t pin       = PA8;
+};
+static FuelInjState fuel_inj;
 
 // ---------------------------------------------------------------------------
-// Cached parameters – refreshed at 1 Hz from dronecan.getParameter()
+// RpmFilterState – EMA filter + plausibility sliding window for RPM/duty
+// ---------------------------------------------------------------------------
+struct RpmFilterState {
+    float    filtered      = 0.0f;    // EMA-filtered RPM
+    float    duty_filtered = 0.0f;    // EMA-filtered duty cycle
+    bool     seeded        = false;   // true after first valid sample; reset on engine stop
+    bool     plaus_win[RPM_K_WIN_MAX] = {}; // circular window: true = sample passed plausibility check
+    int      plaus_head    = 0;       // next write index
+    int      plaus_filled  = 0;       // valid entries so far (0 .. rpm_k_win)
+    int      plaus_passes  = 0;       // count of true entries in active window
+    float    plaus_ref_rpm = 0.0f;    // RPM of last individually-plausible sample
+    uint32_t plaus_ref_ms  = 0;       // millis() of last individually-plausible sample
+};
+static RpmFilterState rpm;
+
+// ---------------------------------------------------------------------------
+// VoltageSensor – shared state for throttle (thr) and coolant temperature (clt)
+// src, i2c_addr, and pin are fixed at boot; the rest are updated live.
+// ---------------------------------------------------------------------------
+struct VoltageSensor {
+    int             src       = 0;    // 0=disabled 1=ADC 2=I2C/INA228; fixed at boot
+    int             i2c_addr  = 0;    // INA228 I2C address; fixed at boot
+    int             pin_param = -1;   // raw parameter value; <0 = disabled; fixed at boot
+    uint32_t        pin       = PA0;  // resolved Arduino pin; fixed at boot
+    Adafruit_INA228 meter;
+    bool            ina228_ok = false;
+    float           alpha     = 1.0f;
+    float           a1        = 1.0f;
+    float           a0        = 0.0f;
+    float           filtered  = 0.0f;
+    bool            seeded    = false; // reset when pin assignment changes or sensor is lost
+};
+static VoltageSensor thr; // throttle position
+static VoltageSensor clt; // coolant temperature
+
+// ---------------------------------------------------------------------------
+// TmpSensor – state for temperature sensor channels (tmp0, tmp1)
+// pin is fixed at boot; the rest are updated live.
+// ---------------------------------------------------------------------------
+struct TmpSensor {
+    int      pin_param = -1;   // raw parameter value; <0 = disabled; fixed at boot
+    uint32_t pin       = 0;    // resolved Arduino pin; fixed at boot
+    int      id        = 0;    // device_id in Temperature message
+    uint32_t bcast     = 1000; // broadcast interval ms
+    float    alpha     = 1.0f;
+    float    a1        = 1.0f;
+    float    a0        = 0.0f;
+    float    filtered  = 0.0f;
+    bool     seeded    = false; // reset when pin assignment changes
+    uint32_t loop_time = 0;    // millis() of last broadcast
+};
+static TmpSensor tmp0; // temperature sensor 0
+static TmpSensor tmp1; // temperature sensor 1
+
+// ---------------------------------------------------------------------------
+// Cached scalar parameters – refreshed at 1 Hz from dronecan.getParameter()
 // ---------------------------------------------------------------------------
 static uint32_t bcast_ms      = 10;
 static float    rpm_alpha     = 1.0f;
@@ -317,55 +312,72 @@ static float    rpm_max_accel = 5000.0f;
 static int      rpm_k_win     = 5;    // set from RPM_K_WIN at boot; requires restart
 static int      rpm_k_acc     = 3;
 static float    duty_alpha    = 1.0f;
-static float    duty_a1    = 1.0f;
-static float    duty_a0    = 0.0f;
-
-// Throttle
-static int      thr_pin_param = -1;  // raw parameter value; <0 = disabled
-static uint32_t thr_pin       = PA0;
-static float    thr_alpha     = 1.0f;
-static float    thr_a1        = 1.0f;
-static float    thr_a0        = 0.0f;
-static Adafruit_INA228 thr_meter;
-static bool            thr_ina228_ok = false;
-static int             thr_src       = 1;  // read once at startup; requires reboot to change
-static int             thr_i2c_addr  = 0x40;
-
-// Coolant temperature
-static int      clt_pin_param = -1;  // raw parameter value; <0 = disabled
-static uint32_t clt_pin       = PA1;
-static float    clt_alpha     = 1.0f;
-static float    clt_a1        = 1.0f;
-static float    clt_a0        = 0.0f;
-static Adafruit_INA228 clt_meter;
-static bool            clt_ina228_ok = false;
-static int             clt_src       = 2;  // read once at startup; requires reboot to change
-static int             clt_i2c_addr  = 0x40;
-
-// Temperature sensor 0
-static int      tmp0_pin_param = -1; // raw parameter value; <0 = disabled
-static uint32_t tmp0_pin       = PB0;
-static int      tmp0_id        = 0;
-static uint32_t tmp0_bcast     = 1000;
-static float    tmp0_alpha     = 1.0f;
-static float    tmp0_a1        = 1.0f;
-static float    tmp0_a0        = 0.0f;
-
-// Temperature sensor 1
-static int      tmp1_pin_param = -1; // raw parameter value; <0 = disabled
-static uint32_t tmp1_pin       = PB1;
-static int      tmp1_id        = 1;
-static uint32_t tmp1_bcast     = 1000;
-static float    tmp1_alpha     = 1.0f;
-static float    tmp1_a1        = 1.0f;
-static float    tmp1_a0        = 0.0f;
+static float    duty_a1       = 1.0f;
+static float    duty_a0       = 0.0f;
 
 // ---------------------------------------------------------------------------
-// last report time.
+// Broadcast timers
+// ---------------------------------------------------------------------------
 static uint32_t loop_bcast = 0;
-static uint32_t loop_tmp0  = 0;
-static uint32_t loop_tmp1  = 0;
 static uint32_t loop_1hz   = 0;
+
+// ---------------------------------------------------------------------------
+// ISR
+// ---------------------------------------------------------------------------
+static void fuelinj_isr()
+{
+    const uint32_t now_us = micros();
+    fuel_inj.last_edge_ms = millis();
+
+    if (digitalRead(fuel_inj.pin) == HIGH) {
+        // Rising edge: commit the just-completed cycle as a matched pair into the
+        // accumulators, but only if we have a valid pulse width for that cycle.
+        if (fuel_inj.rising_us != 0 && fuel_inj.pending_high != 0) {
+            const uint32_t period = now_us - fuel_inj.rising_us;
+            if (period >= min_period_us && period <= MAX_PERIOD_US) {
+                fuel_inj.period_sum   += period;
+                fuel_inj.high_sum     += fuel_inj.pending_high;
+                fuel_inj.sample_count++;
+            }
+            fuel_inj.pending_high = 0;
+        }
+        fuel_inj.rising_us = now_us;
+    } else {
+        // Falling edge: record pulse width of the cycle in progress
+        if (fuel_inj.rising_us != 0) {
+            fuel_inj.pending_high = now_us - fuel_inj.rising_us;
+        }
+    }
+}
+
+// Reset ISR state and attach interrupt to fuel_inj.pin (caller must set fuel_inj.pin first).
+static void attach_fuelinj_pin()
+{
+    noInterrupts();
+    fuel_inj.rising_us    = 0;
+    fuel_inj.pending_high = 0;
+    fuel_inj.period_sum   = 0;
+    fuel_inj.high_sum     = 0;
+    fuel_inj.sample_count = 0;
+    fuel_inj.last_edge_ms = 0;
+    interrupts();
+    pinMode(fuel_inj.pin, INPUT);
+    attachInterrupt(digitalPinToInterrupt(fuel_inj.pin), fuelinj_isr, CHANGE);
+}
+
+// ---------------------------------------------------------------------------
+// Attempt to (re-)initialise an INA228 sensor. Sets vs.ina228_ok.
+// Wire.begin() must already have been called.
+// ---------------------------------------------------------------------------
+static void probe_ina228(VoltageSensor& vs)
+{
+    vs.ina228_ok = vs.meter.begin((uint8_t)vs.i2c_addr);
+    if (vs.ina228_ok) {
+        vs.meter.setAveragingCount(INA228_COUNT_16);
+        vs.meter.setVoltageConversionTime(INA228_TIME_1052_us);
+        vs.meter.setMode(INA228_MODE_CONT_BUS);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Resolve all pin parameters, check for conflicts, and apply.
@@ -394,14 +406,14 @@ static void refresh_pin_params()
 
     // THR_PIN (index 1) is only used when THR_SRC=1; mask it out otherwise to
     // prevent spurious conflicts with CLT_PIN or TMP pins.
-    if (thr_src != 1) {
+    if (thr.src != 1) {
         param_vals[1] = -1;
         pins[1]       = PIN_NOT_FOUND;
     }
 
     // CLT_PIN (index 2) is only used when CLT_SRC=1; mask it out otherwise to
     // prevent spurious conflicts with THR_PIN or TMP pins.
-    if (clt_src != 1) {
+    if (clt.src != 1) {
         param_vals[2] = -1;
         pins[2]       = PIN_NOT_FOUND;
     }
@@ -436,34 +448,34 @@ static void refresh_pin_params()
     // --- Step 3: apply pin changes ---
 
     // FUELINJ_PIN: detach/reattach interrupt if changed
-    if (param_vals[0] != fuelinj_pin_param) {
-        if (fuelinj_pin_param >= 0)
-            detachInterrupt(digitalPinToInterrupt(active_pin));
-        fuelinj_pin_param = param_vals[0];
-        if (fuelinj_pin_param >= 0) {
-            active_pin = pins[0];
+    if (param_vals[0] != fuel_inj.pin_param) {
+        if (fuel_inj.pin_param >= 0)
+            detachInterrupt(digitalPinToInterrupt(fuel_inj.pin));
+        fuel_inj.pin_param = param_vals[0];
+        if (fuel_inj.pin_param >= 0) {
+            fuel_inj.pin = pins[0];
             attach_fuelinj_pin();
         }
     }
 
-    // Analog pins: store actual param value (mirroring fuelinj_pin_param convention).
+    // Analog pins: store actual param value (mirroring fuel_inj.pin_param convention).
     // Reset the EMA seed flag whenever the pin assignment changes so the first
     // reading from the new pin is used directly rather than blended from stale state.
-    if (param_vals[1] != thr_pin_param)  thr_seeded  = false;
-    thr_pin_param = param_vals[1];
-    if (pins[1] != PIN_NOT_FOUND) { thr_pin  = pins[1]; pinMode(thr_pin,  INPUT_ANALOG); }
+    if (param_vals[1] != thr.pin_param)  thr.seeded = false;
+    thr.pin_param = param_vals[1];
+    if (pins[1] != PIN_NOT_FOUND) { thr.pin = pins[1]; pinMode(thr.pin, INPUT_ANALOG); }
 
-    if (param_vals[2] != clt_pin_param)  clt_seeded  = false;
-    clt_pin_param = param_vals[2];
-    if (pins[2] != PIN_NOT_FOUND) { clt_pin  = pins[2]; pinMode(clt_pin,  INPUT_ANALOG); }
+    if (param_vals[2] != clt.pin_param)  clt.seeded = false;
+    clt.pin_param = param_vals[2];
+    if (pins[2] != PIN_NOT_FOUND) { clt.pin = pins[2]; pinMode(clt.pin, INPUT_ANALOG); }
 
-    if (param_vals[3] != tmp0_pin_param) tmp0_seeded = false;
-    tmp0_pin_param = param_vals[3];
-    if (pins[3] != PIN_NOT_FOUND) { tmp0_pin = pins[3]; pinMode(tmp0_pin, INPUT_ANALOG); }
+    if (param_vals[3] != tmp0.pin_param) tmp0.seeded = false;
+    tmp0.pin_param = param_vals[3];
+    if (pins[3] != PIN_NOT_FOUND) { tmp0.pin = pins[3]; pinMode(tmp0.pin, INPUT_ANALOG); }
 
-    if (param_vals[4] != tmp1_pin_param) tmp1_seeded = false;
-    tmp1_pin_param = param_vals[4];
-    if (pins[4] != PIN_NOT_FOUND) { tmp1_pin = pins[4]; pinMode(tmp1_pin, INPUT_ANALOG); }
+    if (param_vals[4] != tmp1.pin_param) tmp1.seeded = false;
+    tmp1.pin_param = param_vals[4];
+    if (pins[4] != PIN_NOT_FOUND) { tmp1.pin = pins[4]; pinMode(tmp1.pin, INPUT_ANALOG); }
 
 #ifdef LOOPBACK_TEST
     if ((int)dronecan.getParameter("LB_EN")) {
@@ -476,7 +488,7 @@ static void refresh_pin_params()
 
 static void refresh_params()
 {
-    bcast_ms   = (uint32_t)constrain((int)dronecan.getParameter("BCAST_MS"), 10, 5000);
+    bcast_ms      = (uint32_t)constrain((int)dronecan.getParameter("BCAST_MS"), 10, 5000);
     rpm_alpha     = dronecan.getParameter("RPM_ALPHA");
     rpm_a1        = dronecan.getParameter("RPM_A1");
     rpm_a0        = dronecan.getParameter("RPM_A0");
@@ -485,48 +497,24 @@ static void refresh_params()
     rpm_max_accel = dronecan.getParameter("RPM_ACCEL");
     rpm_k_acc     = (int)constrain((int)dronecan.getParameter("RPM_K_ACC"), 1, rpm_k_win);
     duty_alpha    = dronecan.getParameter("DUTY_ALPHA");
-    duty_a1    = dronecan.getParameter("DUTY_A1");
-    duty_a0    = dronecan.getParameter("DUTY_A0");
-    thr_alpha  = dronecan.getParameter("THR_ALPHA");
-    thr_a1     = dronecan.getParameter("THR_A1");
-    thr_a0     = dronecan.getParameter("THR_A0");
-    clt_alpha  = dronecan.getParameter("CLT_ALPHA");
-    clt_a1     = dronecan.getParameter("CLT_A1");
-    clt_a0     = dronecan.getParameter("CLT_A0");
-    tmp0_alpha = dronecan.getParameter("TMP0_ALPHA");
-    tmp0_a1    = dronecan.getParameter("TMP0_A1");
-    tmp0_a0    = dronecan.getParameter("TMP0_A0");
-    tmp0_id    = (int)dronecan.getParameter("TMP0_ID");
-    tmp0_bcast = (uint32_t)constrain((int)dronecan.getParameter("TMP0_BCAST"), 10, 5000);
-    tmp1_alpha = dronecan.getParameter("TMP1_ALPHA");
-    tmp1_a1    = dronecan.getParameter("TMP1_A1");
-    tmp1_a0    = dronecan.getParameter("TMP1_A0");
-    tmp1_id    = (int)dronecan.getParameter("TMP1_ID");
-    tmp1_bcast = (uint32_t)constrain((int)dronecan.getParameter("TMP1_BCAST"), 10, 5000);
-}
-
-// Attempt to (re-)initialise the THR INA228. Sets thr_ina228_ok.
-// Wire.begin() must already have been called.
-static void probe_thr_ina228()
-{
-    thr_ina228_ok = thr_meter.begin((uint8_t)thr_i2c_addr);
-    if (thr_ina228_ok) {
-        thr_meter.setAveragingCount(INA228_COUNT_16);
-        thr_meter.setVoltageConversionTime(INA228_TIME_1052_us);
-        thr_meter.setMode(INA228_MODE_CONT_BUS);
-    }
-}
-
-// Attempt to (re-)initialise the CLT INA228. Sets clt_ina228_ok.
-// Wire.begin() must already have been called.
-static void probe_clt_ina228()
-{
-    clt_ina228_ok = clt_meter.begin((uint8_t)clt_i2c_addr);
-    if (clt_ina228_ok) {
-        clt_meter.setAveragingCount(INA228_COUNT_16);
-        clt_meter.setVoltageConversionTime(INA228_TIME_1052_us);
-        clt_meter.setMode(INA228_MODE_CONT_BUS);
-    }
+    duty_a1       = dronecan.getParameter("DUTY_A1");
+    duty_a0       = dronecan.getParameter("DUTY_A0");
+    thr.alpha     = dronecan.getParameter("THR_ALPHA");
+    thr.a1        = dronecan.getParameter("THR_A1");
+    thr.a0        = dronecan.getParameter("THR_A0");
+    clt.alpha     = dronecan.getParameter("CLT_ALPHA");
+    clt.a1        = dronecan.getParameter("CLT_A1");
+    clt.a0        = dronecan.getParameter("CLT_A0");
+    tmp0.alpha    = dronecan.getParameter("TMP0_ALPHA");
+    tmp0.a1       = dronecan.getParameter("TMP0_A1");
+    tmp0.a0       = dronecan.getParameter("TMP0_A0");
+    tmp0.id       = (int)dronecan.getParameter("TMP0_ID");
+    tmp0.bcast    = (uint32_t)constrain((int)dronecan.getParameter("TMP0_BCAST"), 10, 5000);
+    tmp1.alpha    = dronecan.getParameter("TMP1_ALPHA");
+    tmp1.a1       = dronecan.getParameter("TMP1_A1");
+    tmp1.a0       = dronecan.getParameter("TMP1_A0");
+    tmp1.id       = (int)dronecan.getParameter("TMP1_ID");
+    tmp1.bcast    = (uint32_t)constrain((int)dronecan.getParameter("TMP1_BCAST"), 10, 5000);
 }
 
 void setup()
@@ -537,6 +525,14 @@ void setup()
     analogReadResolution(12); // 12-bit ADC: raw 0–4095 matches the 3.3/4095 conversion
     dronecan.init(custom_parameters, "BR-ICEMonitor");
     refresh_params();
+    // RPM_MAX and RPM_K_WIN are intentionally NOT inside refresh_params().
+    // refresh_params() is also called every 1 Hz in the loop, so anything
+    // placed there is re-applied live.  These two parameters require a restart:
+    //   min_period_us is read inside fuelinj_isr() — changing it live while
+    //   the ISR is running would produce inconsistent period filtering mid-flight.
+    //   rpm_k_win sets the circular window size; changing it live would corrupt
+    //   the plaus_head/plaus_filled/plaus_passes counters for the new size.
+    // Reading them once here at boot keeps them stable for the session lifetime.
     {
         const int rpm_max = (int)dronecan.getParameter("RPM_MAX");
         min_period_us = (rpm_max > 0) ? (120000000u / (uint32_t)rpm_max) : 15000u;
@@ -544,30 +540,30 @@ void setup()
         rpm_k_acc = (int)constrain(rpm_k_acc, 1, rpm_k_win); // re-clamp after rpm_k_win is known
     }
 
-    thr_src      = (int)dronecan.getParameter("THR_SRC");
-    thr_i2c_addr = (int)dronecan.getParameter("THR_I2C_ADDR");
-    clt_src      = (int)dronecan.getParameter("CLT_SRC");
-    clt_i2c_addr = (int)dronecan.getParameter("CLT_I2C_ADDR");
+    thr.src      = (int)dronecan.getParameter("THR_SRC");
+    thr.i2c_addr = (int)dronecan.getParameter("THR_I2C_ADDR");
+    clt.src      = (int)dronecan.getParameter("CLT_SRC");
+    clt.i2c_addr = (int)dronecan.getParameter("CLT_I2C_ADDR");
     // Two INA228s on the same bus must have different addresses.
     // If both are configured as I2C with the same address, disable both at runtime;
     // the user must set different addresses (via THR_I2C_ADDR / CLT_I2C_ADDR) and restart.
-    if (thr_src == 2 && clt_src == 2 &&
-        thr_i2c_addr > 0 && clt_i2c_addr > 0 &&
-        thr_i2c_addr == clt_i2c_addr) {
+    if (thr.src == 2 && clt.src == 2 &&
+        thr.i2c_addr > 0 && clt.i2c_addr > 0 &&
+        thr.i2c_addr == clt.i2c_addr) {
         dronecan.debug("THR/CLT INA228 addr conflict", 0);
-        thr_src = 0;
-        clt_src = 0;
+        thr.src = 0;
+        clt.src = 0;
     }
-    if ((thr_src == 2 && thr_i2c_addr > 0) || (clt_src == 2 && clt_i2c_addr > 0))
+    if ((thr.src == 2 && thr.i2c_addr > 0) || (clt.src == 2 && clt.i2c_addr > 0))
         Wire.begin();
-    if (thr_src == 2 && thr_i2c_addr > 0) {
-        probe_thr_ina228();
-        if (!thr_ina228_ok)
+    if (thr.src == 2 && thr.i2c_addr > 0) {
+        probe_ina228(thr);
+        if (!thr.ina228_ok)
             dronecan.debug("THR INA228 not found", 0);
     }
-    if (clt_src == 2 && clt_i2c_addr > 0) {
-        probe_clt_ina228();
-        if (!clt_ina228_ok)
+    if (clt.src == 2 && clt.i2c_addr > 0) {
+        probe_ina228(clt);
+        if (!clt.ina228_ok)
             dronecan.debug("CLT INA228 not found", 0);
     }
 
@@ -581,26 +577,26 @@ void loop()
     // -----------------------------------------------------------------------
     // ICE Status broadcast: at least one source must be configured
     // -----------------------------------------------------------------------
-    const bool thr_configured = (thr_src == 2 && thr_i2c_addr > 0) ||
-                                 (thr_src == 1 && thr_pin_param >= 0);
-    const bool clt_configured = (clt_src == 2 && clt_i2c_addr > 0) ||
-                                 (clt_src == 1 && clt_pin_param >= 0);
-    if ((fuelinj_pin_param >= 0 || thr_configured || clt_configured) && (now - loop_bcast >= bcast_ms)) {
+    const bool thr_configured = (thr.src == 2 && thr.i2c_addr > 0) ||
+                                 (thr.src == 1 && thr.pin_param >= 0);
+    const bool clt_configured = (clt.src == 2 && clt.i2c_addr > 0) ||
+                                 (clt.src == 1 && clt.pin_param >= 0);
+    if ((fuel_inj.pin_param >= 0 || thr_configured || clt_configured) && (now - loop_bcast >= bcast_ms)) {
         loop_bcast = now;
 
         uavcan_equipment_ice_reciprocating_Status pkt{};
 
         // --- Injection (RPM + duty cycle) ---
-        if (fuelinj_pin_param >= 0) {
+        if (fuel_inj.pin_param >= 0) {
             // Snapshot and reset accumulators atomically
             noInterrupts();
-            const uint32_t period_sum = fuelinj_period_sum;
-            const uint32_t high_sum   = fuelinj_high_sum;
-            const uint32_t count      = fuelinj_sample_count;
-            const uint32_t last_edge  = fuelinj_last_edge_ms;
-            fuelinj_period_sum   = 0;
-            fuelinj_high_sum     = 0;
-            fuelinj_sample_count = 0;
+            const uint32_t period_sum = fuel_inj.period_sum;
+            const uint32_t high_sum   = fuel_inj.high_sum;
+            const uint32_t count      = fuel_inj.sample_count;
+            const uint32_t last_edge  = fuel_inj.last_edge_ms;
+            fuel_inj.period_sum   = 0;
+            fuel_inj.high_sum     = 0;
+            fuel_inj.sample_count = 0;
             interrupts();
 
             // Two-tier stale detection.
@@ -619,14 +615,14 @@ void loop()
 
             if (stopped) {
                 // Engine truly stopped: zero outputs and reset all filter state
-                rpm_filtered   = 0.0f;
-                duty_filtered  = 0.0f;
-                fuelinj_seeded = false;
-                plaus_head     = 0;
-                plaus_filled   = 0;
-                plaus_passes   = 0;
-                plaus_ref_ms   = 0;
-                plaus_ref_rpm  = 0.0f;
+                rpm.filtered      = 0.0f;
+                rpm.duty_filtered = 0.0f;
+                rpm.seeded        = false;
+                rpm.plaus_head    = 0;
+                rpm.plaus_filled  = 0;
+                rpm.plaus_passes  = 0;
+                rpm.plaus_ref_ms  = 0;
+                rpm.plaus_ref_rpm = 0.0f;
             } else if (!held && count > 0) {
                 // Fresh signal: apply plausibility filter before updating EMA.
                 //
@@ -637,42 +633,51 @@ void loop()
                 // first samples whose period spans the entire cut duration.
                 //
                 // A sliding window of RPM_K_WIN results is maintained.  The EMA is
-                // updated only when RPM_K_ACC of the last RPM_K_WIN samples pass,
-                // tolerating occasional single-sample rejections without stalling on
-                // genuine rapid RPM changes.  When fewer than RPM_K_ACC pass, the EMA
-                // is frozen at the last accepted value.
+                // updated only when RPM_K_ACC of the last RPM_K_WIN samples pass AND
+                // the current sample itself passes, so a rejected sample never feeds
+                // the EMA regardless of window history.  When fewer than RPM_K_ACC
+                // pass, the EMA is frozen at the last accepted value.
+                //
+                // Note – BCAST_MS dependency:
+                //   The plausibility check operates on the mean period of all cycles
+                //   committed within one broadcast window (period_sum / count).  If
+                //   BCAST_MS is large enough that a normal and a skip/spurious cycle
+                //   both land in the same window, the anomaly is diluted in the
+                //   average and may appear less extreme to the filter.  At the default
+                //   BCAST_MS=10 ms and RPM ≤ 8000 (period ≥ 15 ms) at most one cycle
+                //   lands per window, so mixing does not occur in practice.
                 const float mean_period = (float)period_sum / (float)count;
                 const float mean_high   = (float)high_sum   / (float)count;
                 const float rpm_raw     = 120000000.0f / mean_period;
                 const float duty_raw    = 100.0f * mean_high / mean_period;
 
                 bool plaus_pass;
-                if (plaus_ref_ms == 0) {
+                if (rpm.plaus_ref_ms == 0) {
                     // No reference yet (first sample after start/stop): accept unconditionally
                     plaus_pass = true;
                 } else {
-                    const float dt_s  = (float)(now - plaus_ref_ms) * 0.001f;
-                    const float accel = fabsf(rpm_raw - plaus_ref_rpm) / fmaxf(dt_s, 0.001f);
+                    const float dt_s  = (float)(now - rpm.plaus_ref_ms) * 0.001f;
+                    const float accel = fabsf(rpm_raw - rpm.plaus_ref_rpm) / fmaxf(dt_s, 0.001f);
                     plaus_pass = (accel <= rpm_max_accel);
                 }
                 if (plaus_pass) {
-                    plaus_ref_rpm = rpm_raw;
-                    plaus_ref_ms  = now;
+                    rpm.plaus_ref_rpm = rpm_raw;
+                    rpm.plaus_ref_ms  = now;
                 }
 
                 // Update circular sliding window
-                if (plaus_filled < rpm_k_win) {
+                if (rpm.plaus_filled < rpm_k_win) {
                     // Window filling: append without overwriting
-                    plaus_win[plaus_head] = plaus_pass;
-                    if (plaus_pass) plaus_passes++;
-                    plaus_head = (plaus_head + 1) % rpm_k_win;
-                    plaus_filled++;
+                    rpm.plaus_win[rpm.plaus_head] = plaus_pass;
+                    if (plaus_pass) rpm.plaus_passes++;
+                    rpm.plaus_head = (rpm.plaus_head + 1) % rpm_k_win;
+                    rpm.plaus_filled++;
                 } else {
                     // Window full: overwrite oldest entry
-                    if (plaus_win[plaus_head]) plaus_passes--;
-                    plaus_win[plaus_head] = plaus_pass;
-                    if (plaus_pass)         plaus_passes++;
-                    plaus_head = (plaus_head + 1) % rpm_k_win;
+                    if (rpm.plaus_win[rpm.plaus_head]) rpm.plaus_passes--;
+                    rpm.plaus_win[rpm.plaus_head] = plaus_pass;
+                    if (plaus_pass)                rpm.plaus_passes++;
+                    rpm.plaus_head = (rpm.plaus_head + 1) % rpm_k_win;
                 }
 
                 // Commit to EMA when the current sample individually passes AND
@@ -680,15 +685,15 @@ void loop()
                 // must never feed the EMA even if old True entries remain in
                 // the window (prevents skip-injection / spurious edges from
                 // contaminating the EMA while the window is still draining).
-                if (plaus_pass && plaus_passes >= rpm_k_acc) {
-                    if (!fuelinj_seeded) {
+                if (plaus_pass && rpm.plaus_passes >= rpm_k_acc) {
+                    if (!rpm.seeded) {
                         // Seed with first accepted sample to avoid ramping up from 0
-                        rpm_filtered   = rpm_raw;
-                        duty_filtered  = duty_raw;
-                        fuelinj_seeded = true;
+                        rpm.filtered      = rpm_raw;
+                        rpm.duty_filtered = duty_raw;
+                        rpm.seeded        = true;
                     } else {
-                        rpm_filtered  = rpm_alpha  * rpm_raw  + (1.0f - rpm_alpha)  * rpm_filtered;
-                        duty_filtered = duty_alpha * duty_raw + (1.0f - duty_alpha) * duty_filtered;
+                        rpm.filtered      = rpm_alpha  * rpm_raw  + (1.0f - rpm_alpha)  * rpm.filtered;
+                        rpm.duty_filtered = duty_alpha * duty_raw + (1.0f - duty_alpha) * rpm.duty_filtered;
                     }
                 }
                 // else: plausibility window not passing threshold — freeze EMA
@@ -698,14 +703,14 @@ void loop()
             pkt.state = running
                 ? UAVCAN_EQUIPMENT_ICE_RECIPROCATING_STATUS_STATE_RUNNING
                 : UAVCAN_EQUIPMENT_ICE_RECIPROCATING_STATUS_STATE_STOPPED;
-            pkt.engine_speed_rpm            = (uint32_t)constrain(rpm_a1 * rpm_filtered + rpm_a0, 0.0f, 131071.0f);
-            pkt.fuel_consumption_rate_cm3pm = duty_a1 * duty_filtered + duty_a0;
+            pkt.engine_speed_rpm            = (uint32_t)constrain(rpm_a1 * rpm.filtered + rpm_a0, 0.0f, 131071.0f);
+            pkt.fuel_consumption_rate_cm3pm = duty_a1 * rpm.duty_filtered + duty_a0;
 
             // FLAG_CRANKSHAFT_SENSOR_ERROR: set when RPM data is held (no fresh signal)
             // or when the plausibility filter is actively rejecting samples.
             const bool plaus_rejecting = !held
-                                      && (plaus_filled >= rpm_k_win)
-                                      && (plaus_passes  < rpm_k_acc);
+                                      && (rpm.plaus_filled >= rpm_k_win)
+                                      && (rpm.plaus_passes  < rpm_k_acc);
             const bool crank_error = running && (held || plaus_rejecting);
             pkt.flags =
                 UAVCAN_EQUIPMENT_ICE_RECIPROCATING_STATUS_FLAG_CRANKSHAFT_SENSOR_ERROR_SUPPORTED
@@ -722,17 +727,17 @@ void loop()
         {
             bool  thr_valid   = false;
             float thr_voltage = 0.0f;
-            if (thr_src == 2 && thr_ina228_ok) {
-                thr_voltage = thr_meter.getBusVoltage_V();
+            if (thr.src == 2 && thr.ina228_ok) {
+                thr_voltage = thr.meter.getBusVoltage_V();
                 thr_valid   = true;
-            } else if (thr_src == 1 && thr_pin_param >= 0) {
-                thr_voltage = analogRead(thr_pin) * (3.3f / 4095.0f);
+            } else if (thr.src == 1 && thr.pin_param >= 0) {
+                thr_voltage = analogRead(thr.pin) * (3.3f / 4095.0f);
                 thr_valid   = true;
             }
             if (thr_valid) {
-                if (!thr_seeded) { thr_filtered = thr_voltage; thr_seeded = true; }
-                else thr_filtered = thr_alpha * thr_voltage + (1.0f - thr_alpha) * thr_filtered;
-                const float thr_pct = thr_a1 * thr_filtered + thr_a0;
+                if (!thr.seeded) { thr.filtered = thr_voltage; thr.seeded = true; }
+                else thr.filtered = thr.alpha * thr_voltage + (1.0f - thr.alpha) * thr.filtered;
+                const float thr_pct = thr.a1 * thr.filtered + thr.a0;
                 pkt.throttle_position_percent = (uint8_t)constrain(roundf(thr_pct), 0.0f, 100.0f);
                 //Serial.print("  Thr: "); Serial.print(thr_pct, 1); Serial.print(" %");
             } else {
@@ -744,17 +749,17 @@ void loop()
         {
             bool  clt_valid   = false;
             float clt_voltage = 0.0f;
-            if (clt_src == 2 && clt_ina228_ok) {
-                clt_voltage = clt_meter.getBusVoltage_V();
+            if (clt.src == 2 && clt.ina228_ok) {
+                clt_voltage = clt.meter.getBusVoltage_V();
                 clt_valid   = true;
-            } else if (clt_src == 1 && clt_pin_param >= 0) {
-                clt_voltage = analogRead(clt_pin) * (3.3f / 4095.0f);
+            } else if (clt.src == 1 && clt.pin_param >= 0) {
+                clt_voltage = analogRead(clt.pin) * (3.3f / 4095.0f);
                 clt_valid   = true;
             }
             if (clt_valid) {
-                if (!clt_seeded) { clt_filtered = clt_voltage; clt_seeded = true; }
-                else clt_filtered = clt_alpha * clt_voltage + (1.0f - clt_alpha) * clt_filtered;
-                pkt.coolant_temperature = clt_a1 * clt_filtered + clt_a0;
+                if (!clt.seeded) { clt.filtered = clt_voltage; clt.seeded = true; }
+                else clt.filtered = clt.alpha * clt_voltage + (1.0f - clt.alpha) * clt.filtered;
+                pkt.coolant_temperature = clt.a1 * clt.filtered + clt.a0;
                 //Serial.print("  CLT: "); Serial.print(pkt.coolant_temperature, 1);
             }
             else
@@ -770,16 +775,16 @@ void loop()
     // -----------------------------------------------------------------------
     // Temperature sensor 0 broadcast (when TMP0_PIN >= 0)
     // -----------------------------------------------------------------------
-    if (tmp0_pin_param >= 0 && (now - loop_tmp0 >= tmp0_bcast)) {
-        loop_tmp0 = now;
+    if (tmp0.pin_param >= 0 && (now - tmp0.loop_time >= tmp0.bcast)) {
+        tmp0.loop_time = now;
 
-        const float voltage = analogRead(tmp0_pin) * (3.3f / 4095.0f);
-        if (!tmp0_seeded) { tmp0_filtered = voltage; tmp0_seeded = true; }
-        else tmp0_filtered = tmp0_alpha * voltage + (1.0f - tmp0_alpha) * tmp0_filtered;
-        const float temp0 = tmp0_a1 * tmp0_filtered + tmp0_a0;
+        const float voltage = analogRead(tmp0.pin) * (3.3f / 4095.0f);
+        if (!tmp0.seeded) { tmp0.filtered = voltage; tmp0.seeded = true; }
+        else tmp0.filtered = tmp0.alpha * voltage + (1.0f - tmp0.alpha) * tmp0.filtered;
+        const float temp0 = tmp0.a1 * tmp0.filtered + tmp0.a0;
 
         uavcan_equipment_device_Temperature pkt{};
-        pkt.device_id   = (uint16_t)tmp0_id;
+        pkt.device_id   = (uint16_t)tmp0.id;
         pkt.temperature = temp0;
         pkt.error_flags = 0;
         sendUavcanMsg(dronecan.canard, pkt);
@@ -792,16 +797,16 @@ void loop()
     // -----------------------------------------------------------------------
     // Temperature sensor 1 broadcast (when TMP1_PIN >= 0)
     // -----------------------------------------------------------------------
-    if (tmp1_pin_param >= 0 && (now - loop_tmp1 >= tmp1_bcast)) {
-        loop_tmp1 = now;
+    if (tmp1.pin_param >= 0 && (now - tmp1.loop_time >= tmp1.bcast)) {
+        tmp1.loop_time = now;
 
-        const float voltage = analogRead(tmp1_pin) * (3.3f / 4095.0f);
-        if (!tmp1_seeded) { tmp1_filtered = voltage; tmp1_seeded = true; }
-        else tmp1_filtered = tmp1_alpha * voltage + (1.0f - tmp1_alpha) * tmp1_filtered;
-        const float temp1 = tmp1_a1 * tmp1_filtered + tmp1_a0;
+        const float voltage = analogRead(tmp1.pin) * (3.3f / 4095.0f);
+        if (!tmp1.seeded) { tmp1.filtered = voltage; tmp1.seeded = true; }
+        else tmp1.filtered = tmp1.alpha * voltage + (1.0f - tmp1.alpha) * tmp1.filtered;
+        const float temp1 = tmp1.a1 * tmp1.filtered + tmp1.a0;
 
         uavcan_equipment_device_Temperature pkt{};
-        pkt.device_id   = (uint16_t)tmp1_id;
+        pkt.device_id   = (uint16_t)tmp1.id;
         pkt.temperature = temp1;
         pkt.error_flags = 0;
         sendUavcanMsg(dronecan.canard, pkt);
@@ -821,25 +826,25 @@ void loop()
         refresh_params();
 
         // INA228 health-check and retry
-        if (thr_src == 2 && thr_i2c_addr > 0) {
-            if (!thr_ina228_ok) {
-                probe_thr_ina228();
-                if (thr_ina228_ok)
+        if (thr.src == 2 && thr.i2c_addr > 0) {
+            if (!thr.ina228_ok) {
+                probe_ina228(thr);
+                if (thr.ina228_ok)
                     dronecan.debug("THR INA228 found", 0);
-            } else if (!thr_meter.conversionReady()) {
+            } else if (!thr.meter.conversionReady()) {
                 // conversionReady() reads DIAG_ALRT/CNVR — see CLT block comment below.
-                thr_ina228_ok = false;
-                thr_seeded    = false;
+                thr.ina228_ok = false;
+                thr.seeded    = false;
                 dronecan.debug("THR INA228 lost", 0);
             }
         }
-        if (clt_src == 2 && clt_i2c_addr > 0) {
-            if (!clt_ina228_ok) {
+        if (clt.src == 2 && clt.i2c_addr > 0) {
+            if (!clt.ina228_ok) {
                 // Sensor was missing at boot or lost: retry
-                probe_clt_ina228();
-                if (clt_ina228_ok)
+                probe_ina228(clt);
+                if (clt.ina228_ok)
                     dronecan.debug("CLT INA228 found", 0);
-            } else if (!clt_meter.conversionReady()) {
+            } else if (!clt.meter.conversionReady()) {
                 // How this check works:
                 //   conversionReady() reads the DIAG_ALRT register and tests the CNVR bit.
                 //   The INA228 hardware sets CNVR on every completed conversion (~17 ms in
@@ -849,8 +854,8 @@ void loop()
                 //   guaranteed to be set on a live sensor.  If conversionReady() returns false
                 //   here, it means the I2C read returned 0 (NACK), i.e. the sensor is gone.
                 //   Detection latency is up to ~1 s (one tick of the 1 Hz block).
-                clt_ina228_ok = false;
-                clt_seeded    = false;
+                clt.ina228_ok = false;
+                clt.seeded    = false;
                 dronecan.debug("CLT INA228 lost", 0);
             }
         }

@@ -149,6 +149,16 @@ via the preserved staging variables. However, a shorter broadcast interval
 increases the proportion of empty windows and slows EMA convergence. A
 BCAST_MS of 100-500 ms is recommended for idle engine speeds.
 
+Note on BCAST_MS and plausibility filter effectiveness: the plausibility
+check operates on the mean period of all cycles within one broadcast window.
+If BCAST_MS is large enough that a normal cycle and an anomalous cycle (skip-
+injection or spurious edge) both land in the same window, their periods are
+averaged before the check runs, diluting the anomaly and potentially reducing
+its apparent RPM/s change. At the default BCAST_MS=10 ms and RPM_MAX=8000
+(injection period 15 ms), at most one cycle lands per window, so dilution
+does not occur in practice. Users increasing BCAST_MS substantially above
+the injection period should be aware of this effect.
+
 
 DUTY CYCLE CALCULATION
 ----------------------

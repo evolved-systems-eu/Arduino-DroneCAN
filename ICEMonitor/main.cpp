@@ -43,6 +43,7 @@
  *   NODEID     – DroneCAN node ID (default 5)
  *   BAUD       – CAN baudrate kbps: 500 or 1000 (default 500; stored in flash, effective after restart)
  *   FUELINJ_PIN  – injection input pin (default 8 = A8); <0 = disabled
+ *   FUELINJ_POL  – injection signal polarity: 0=active-high 1=active-low (default 0; requires restart)
  *   BCAST_MS   – ICE Status broadcast interval ms (default 10)
  *   RPM_MAX    – max measurable RPM; periods faster than this are rejected (default 8000; requires restart)
  *   RPM_ALPHA  – EMA alpha for RPM, 0.01–1.0 (default 0.2)
@@ -95,7 +96,7 @@
 // ---------------------------------------------------------------------------
 // Loopback test: define LOOPBACK_TEST to generate a PWM signal on PA1 and
 // wire PA1 → injection input pin (default PA8) for self-testing without ECU.
-// LB_EN / LB_DUTY / LB_FREQ are DroneCAN parameters, changeable live from GUI.
+// LB_EN / LB_DUTY / LB_FREQ / LB_POL are DroneCAN parameters, changeable live from GUI.
 // Remove this define (and the #ifdef sections below) before production use.
 // ---------------------------------------------------------------------------
 #define LOOPBACK_TEST
@@ -178,6 +179,7 @@ std::vector<DroneCAN::parameter> custom_parameters = {
     {"NODEID",     DroneCAN::INT,  5,      0,          127       },
     {"BAUD",       DroneCAN::INT,  500,    500,        1000      }, // requires restart
     {"FUELINJ_PIN",    DroneCAN::INT,  8,      -1,         101       }, // <0=disabled
+    {"FUELINJ_POL",    DroneCAN::INT,  0,      0,          1         }, // 0=active-high 1=active-low; requires restart
     {"BCAST_MS",   DroneCAN::INT,  10,     10,         5000      },
     {"RPM_ALPHA",  DroneCAN::REAL, 0.2f,   0.01f,      1.0f      },
     {"RPM_A1",     DroneCAN::REAL, 1.0f,   -10000.0f,  10000.0f  },
@@ -221,6 +223,7 @@ std::vector<DroneCAN::parameter> custom_parameters = {
     {"LB_EN",      DroneCAN::INT,  1,      0,          1         }, // 0=off 1=on
     {"LB_DUTY",    DroneCAN::INT,  50,     0,          100       }, // [%]
     {"LB_FREQ",    DroneCAN::INT,  60,     1,          20000     }, // [Hz]
+    {"LB_POL",     DroneCAN::INT,  1,      0,          1         }, // 0=active-high 1=active-low
 #endif
 };
 
@@ -233,14 +236,15 @@ DroneCAN dronecan;
 #define RPM_K_WIN_MAX  10
 
 struct FuelInjState {
-    volatile uint32_t rising_us    = 0; // micros() at the last rising edge
+    volatile uint32_t rising_us    = 0; // micros() at the last inj_start edge
     volatile uint32_t pending_high = 0; // pulse width of the cycle in progress (not yet committed)
     volatile uint32_t period_sum   = 0; // accumulator: sum of committed period_us values
     volatile uint32_t high_sum     = 0; // accumulator: sum of committed high_us values
     volatile uint32_t sample_count = 0; // number of complete cycles committed since last broadcast
-    volatile uint32_t last_edge_ms = 0; // millis() at the last edge
-    int      pin_param = INT32_MIN;     // sentinel: not yet initialised; triggers attach on first refresh_pin_params()
+    volatile uint32_t last_edge_ms = 0; // millis() at the last edge (stale detection)
+    int      pin_param = INT32_MIN;     // sentinel: not yet initialised
     uint32_t pin       = PA8;
+    int      pol       = 0;             // 0=active-high 1=active-low; fixed at boot
 };
 static FuelInjState fuel_inj;
 
@@ -329,9 +333,16 @@ static void fuelinj_isr()
     const uint32_t now_us = micros();
     fuel_inj.last_edge_ms = millis();
 
-    if (digitalRead(fuel_inj.pin) == HIGH) {
-        // Rising edge: commit the just-completed cycle as a matched pair into the
-        // accumulators, but only if we have a valid pulse width for that cycle.
+    // inj_start = true on the edge that begins an injection pulse.
+    // With active-high (pol=0): injection starts on rising edge (pin HIGH).
+    // With active-low  (pol=1): injection starts on falling edge (pin LOW).
+    int val = digitalRead(fuel_inj.pin);
+    const bool inj_start = ( (val == HIGH) && (fuel_inj.pol == 0) ) || 
+                            ( (val == LOW) && (fuel_inj.pol == 1) );
+
+    if (inj_start) {
+        // Start of injection pulse: commit the just-completed cycle as a matched
+        // pair into the accumulators, but only if we have a valid pulse width.
         if (fuel_inj.rising_us != 0 && fuel_inj.pending_high != 0) {
             const uint32_t period = now_us - fuel_inj.rising_us;
             if (period >= min_period_us && period <= MAX_PERIOD_US) {
@@ -343,8 +354,12 @@ static void fuelinj_isr()
         }
         fuel_inj.rising_us = now_us;
     } else {
-        // Falling edge: record pulse width of the cycle in progress
-        if (fuel_inj.rising_us != 0) {
+        // End of injection pulse: record pulse width of the cycle in progress.
+        // First edge only: once pending_high is set, later edges within the same
+        // cycle (bounce, ringing after solenoid release) are ignored.  This prevents
+        // a late spurious edge from overwriting pending_high with a near-period value
+        // and producing a falsely high duty reading.
+        if (fuel_inj.rising_us != 0 && fuel_inj.pending_high == 0) {
             fuel_inj.pending_high = now_us - fuel_inj.rising_us;
         }
     }
@@ -480,7 +495,8 @@ static void refresh_pin_params()
 #ifdef LOOPBACK_TEST
     if ((int)dronecan.getParameter("LB_EN")) {
         analogWriteFrequency((int)dronecan.getParameter("LB_FREQ"));
-        analogWrite(LOOPBACK_PIN, (int)(dronecan.getParameter("LB_DUTY") * 255.0f / 100.0f));
+        const int lb_val = (int)(dronecan.getParameter("LB_DUTY") * 255.0f / 100.0f);
+        analogWrite(LOOPBACK_PIN, (int)dronecan.getParameter("LB_POL") ? (255 - lb_val) : lb_val);
     }
     // LB_EN=0: leave pin unconfigured (high-impedance INPUT)
 #endif
@@ -540,6 +556,7 @@ void setup()
         rpm_k_acc = (int)constrain(rpm_k_acc, 1, rpm_k_win); // re-clamp after rpm_k_win is known
     }
 
+    fuel_inj.pol = (int)dronecan.getParameter("FUELINJ_POL");
     thr.src      = (int)dronecan.getParameter("THR_SRC");
     thr.i2c_addr = (int)dronecan.getParameter("THR_I2C_ADDR");
     clt.src      = (int)dronecan.getParameter("CLT_SRC");
@@ -611,7 +628,7 @@ void loop()
             const uint32_t no_signal_ms = (elapsed_i < 0) ? 0u : (uint32_t)elapsed_i;
             const bool stopped = (last_edge == 0) || (no_signal_ms >= rpm_stop_ms);
             const bool held    = !stopped && (no_signal_ms >= rpm_hold_ms);
-            const bool running = !stopped;
+            const bool running = !stopped;  // Can be held or running.
 
             if (stopped) {
                 // Engine truly stopped: zero outputs and reset all filter state
@@ -666,19 +683,11 @@ void loop()
                 }
 
                 // Update circular sliding window
-                if (rpm.plaus_filled < rpm_k_win) {
-                    // Window filling: append without overwriting
-                    rpm.plaus_win[rpm.plaus_head] = plaus_pass;
-                    if (plaus_pass) rpm.plaus_passes++;
-                    rpm.plaus_head = (rpm.plaus_head + 1) % rpm_k_win;
-                    rpm.plaus_filled++;
-                } else {
-                    // Window full: overwrite oldest entry
-                    if (rpm.plaus_win[rpm.plaus_head]) rpm.plaus_passes--;
-                    rpm.plaus_win[rpm.plaus_head] = plaus_pass;
-                    if (plaus_pass)                rpm.plaus_passes++;
-                    rpm.plaus_head = (rpm.plaus_head + 1) % rpm_k_win;
-                }
+                if (rpm.plaus_filled >= rpm_k_win && rpm.plaus_win[rpm.plaus_head]) rpm.plaus_passes--;
+                rpm.plaus_win[rpm.plaus_head] = plaus_pass;
+                if (plaus_pass) rpm.plaus_passes++;
+                rpm.plaus_head = (rpm.plaus_head + 1) % rpm_k_win;
+                if (rpm.plaus_filled < rpm_k_win) rpm.plaus_filled++;
 
                 // Commit to EMA when the current sample individually passes AND
                 // the window confirms enough recent passes.  A rejected sample
